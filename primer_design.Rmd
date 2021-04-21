@@ -1,0 +1,815 @@
+---
+title: "Qfly metabarcoding"
+subtitle: "Primer design"
+author: "Alexander Piper"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction
+
+## Load packages
+```{r setup}
+#Set required packages
+.cran_packages <- c("usethis",
+                    "tidyverse",
+                    "tidymodels",
+                    "chngpt",
+                    "spider", 
+                    "insect",
+                    "ape",
+                    "RColorBrewer",
+                    "seqinr",
+                    "patchwork",
+                    "ShortRead",
+                    "foreach",
+                    "doParallel",
+                    "TmCalculator",
+                    "castor",
+                    "furrr",
+                    "UpSetR",
+                    "DescTools")
+
+.bioc_packages <- c("DECIPHER",
+                    "ggtree",
+                    "Biostrings")
+
+.inst <- .cran_packages %in% installed.packages()
+if(any(!.inst)) {
+   install.packages(.cran_packages[!.inst])
+}
+.inst <- .bioc_packages %in% installed.packages()
+if(any(!.inst)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+  BiocManager::install(.bioc_packages[!.inst], ask = F)
+}
+
+#Load all packages
+sapply(c(.cran_packages,.bioc_packages), require, character.only = TRUE)
+
+# Github packages
+devtools::install_github("alexpiper/taxreturn")
+library(taxreturn)
+library(PrimerMiner)
+
+# SOurce internal functions
+source("R/themes.R")
+source("R/helper_functions.R")
+```
+
+
+# Merge alignments
+```{r merge alignments}
+dir.create("diagnostic_alignments/merged")
+
+# COI
+fs::dir_ls(path="diagnostic_alignments/", glob = "*COI*.fa") %>%
+  purrr::map(readDNAStringSet) %>%
+  purrr::map(writeXStringSet, filepath="diagnostic_alignments/merged/COI_merged.fa", append=TRUE, width=20000)
+
+# EIF3L
+fs::dir_ls(path="diagnostic_alignments/", glob = "*EIF3L*.fa") %>%
+  purrr::map(readDNAStringSet) %>%
+  purrr::map(writeXStringSet, filepath="diagnostic_alignments/merged/EIF3L_merged.fa", append=TRUE, width=20000)
+
+# DDOST
+fs::dir_ls(path="diagnostic_alignments/", glob = "*DDOST*.fa") %>%
+  purrr::map(readDNAStringSet) %>%
+  purrr::map(writeXStringSet, filepath="diagnostic_alignments/merged/DDOST_merged.fa", append=TRUE, width=20000)
+
+# POP4
+fs::dir_ls(path="diagnostic_alignments/", glob = "*POP4*.fa") %>%
+  purrr::map(readDNAStringSet) %>%
+  purrr::map(writeXStringSet, filepath="diagnostic_alignments/merged/POP4_merged.fa", append=TRUE, width=20000)
+
+# RPA2
+fs::dir_ls(path="diagnostic_alignments/", glob = "*RPA2*.fa") %>%
+  purrr::map(readDNAStringSet) %>%
+  purrr::map(writeXStringSet, filepath="diagnostic_alignments/merged/RPA2_merged.fa", append=TRUE, width=20000)
+```
+
+
+# Create PHMMs
+
+```{r create PHMMS}
+dir.create("diagnostic_alignments/aligned")
+dir.create("diagnostic_alignments/model")
+
+fs::dir_ls(path="diagnostic_alignments/merged", glob = "*.fa") %>%
+  purrr::map(function(x){
+    # Align all sequences
+    aligned <- readDNAStringSet(x) %>%
+      replaceAmbiguities("-") %>%
+      RemoveGaps()%>%
+      AlignSeqs()
+    
+    # Filter short sequences
+    aligned <- aligned[letterFrequency(aligned, "ACGT") > 200]
+    
+    # Filter for stop codons
+    aligned <- taxreturn::codon_filter(aligned)
+    
+    #Write out aligned sequences
+    writeXStringSet(aligned, filepath= x %>% str_replace_all("merged", "aligned"), append=TRUE, width=20000)
+  
+    # Create PHMM
+    model <- aphid::derivePHMM(as.DNAbin(aligned))
+    saveRDS(model, x %>% str_replace_all("merged", "model") %>% str_replace(".fa", ".rds"))
+    
+})
+
+```
+
+# Entropy
+
+```{r entropy}
+#Set moving average function - Adjust smoothing (n=5?)
+ma <- function(x, n=3, sides=2){
+  if(length(x) >= n){stats::filter(x, rep(1/n, n), sides=sides)
+    }else NA_real_
+  }
+
+
+# Entropy & Basecomp bar plots
+entropy_plots <- fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
+  purrr::map(function(x){
+    seqs <- insect::readFASTA(x)
+    ent <- taxreturn::alignment_entropy(as.list(seqs), maskgaps=1, countgaps=FALSE, 
+                                        method="ML", unit="log", return_extra = TRUE) %>%
+      ungroup() %>%
+      mutate(ent = ent %>% 
+               na_if("") %>%
+               replace_na(0)) %>%
+      mutate(ma = ma(ent, n = 3, sides=1)) %>%
+      mutate(ma = ma %>% replace_na(0))
+    
+    # Plot entropy
+    gg.ent <- ent %>%
+      mutate(pos = as.numeric(pos)) %>%
+      ggplot(aes(x = pos, y = ma))+
+      geom_line() +
+      theme_void()+
+          scale_x_continuous(expand=c(0,0), breaks = seq(0, max(lengths(seqs)), 10))+
+          scale_y_continuous(expand=c(0,0)) +
+      labs( title = x %>% 
+             str_remove("_aligned.*$") %>%
+             str_remove("^.*/"))
+    
+    # Plot basecomposition
+    gg.basecomp <- ent %>%
+      pivot_longer(c("A", "C", "G", "T"),
+                   names_to = "base",
+                   values_to="value") %>%
+      group_by(pos) %>%
+      mutate(prob = value / sum(value)) %>%
+      mutate(pos = as.numeric(pos)) %>%
+      ggplot(aes(x = pos, y = prob, fill=base))+
+      geom_col() +
+      theme_bw()+
+      scale_x_continuous(expand=c(0,0), breaks = seq(0, max(lengths(seqs)), 10))+
+      scale_y_continuous(expand=c(0,0), labels=scales::percent_format()) +
+      labs(x = NULL,
+           y = NULL,
+           fill="Base")+
+      scale_fill_manual(values=c("A" = "firebrick", "T" = "green", "G" = "goldenrod", "C" = "mediumblue"))
+  
+    gg.ent / gg.basecomp
+    
+    })
+
+gg.entropy <- wrap_plots(entropy_plots, ncol=1)
+
+
+pdf(file="fig/entropy_basecomp.pdf", width = 50, height = 8)
+  plot(gg.entropy)
+try(dev.off(), silent=TRUE)
+```
+
+
+# SPIDER Sliding window
+
+```{r sliding window}
+# Set window parameters
+win_length <- c(220, 320, 420)
+win_int <- 3
+
+sw_results <- fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
+  purrr::map(function(x){
+  print(x)
+  seqs <- insect::readFASTA(x)
+  
+  # species names
+  spp_names <- names(seqs) %>%
+    str_remove("_*(?!.*_).*$") 
+  
+  # Sliding window analyses
+  dat <- as.matrix(seqs)
+  dimnames(dat)[[1]] <- spp_names
+  
+  # Make full distance matrix
+  datd <- dist.dna(dat, pairwise.deletion = TRUE)
+
+  # Create NJ tree from entire distance matrix
+  dat_tr <- bionjs(datd)
+  
+  # Fix any negative edge lengths
+  dat_tr <- fix_negative_edge_length(dat_tr, collapse_multi = TRUE)
+  
+ 
+  
+  # Identification success with full tree 
+  full_mono <- tibble(spp = unique(spp_names), 
+               mono = monophyly(dat_tr, spp_names))
+  full_nn <- tibble(seqs = names(seqs),
+               spp = spp_names, 
+               nn = nearNeighbour(datd, spp_names))
+  
+  # Create plot of full tree
+  p1 <- ggtree(dat_tr)
+  
+  tree_labels <- p1$data %>% 
+    left_join(full_mono %>% dplyr::rename(label = spp), by="label")
+  
+  p2 <- p1 %<+% tree_labels + 
+    geom_tippoint(aes(colour=mono)) +
+    geom_tiplab()+
+    theme(legend.position = "top")+
+    labs(colour = "Monophyletic") +
+    scale_colour_manual(values=c("#e41a1c","#4daf4a"))
+  
+  # Save figure
+  out.dir <- x %>% as.character() %>% dirname() %>% str_replace_all("aligned", "tree")
+  if(!dir.exists(out.dir)){ dir.create(out.dir)}
+  
+  #Might be worth changing output height depending on number of seqs
+  pdf(file= x %>% str_replace_all("aligned", "tree") %>% str_replace_all(".fa", ".pdf"), width = 8, height = 30)
+    plot(p2)
+  try(dev.off(), silent=TRUE)
+  
+  # Sliding windows
+  window_results <- vector("list", length=length(win_length))
+  for (w in 1:length(win_length)){
+    
+    # Create windows
+    win <- slidingWindow(dat, width=win_length[w], interval = win_int)
+    pos_out <- sapply(win, function(x) attr(x, "window")[1])
+    
+    # Create distance matrices for each window
+    win_dist <- lapply(win, function(x) dist.dna(x, pairwise.deletion = TRUE))
+  
+    # Get mean K2P distance per window
+    dist_mean_out <- sapply(win_dist, function(x) mean(x, na.rm = TRUE))
+    
+    # Get number of diagnostic nucleotides      
+    nd_out <- slideNucDiag(dat, spp_names, width=win_length[w], interval = win_int)
+    nd_out <- colSums(nd_out)
+    
+    #depth <- which(node.depth(dat_tr)[node.depth(dat_tr) > 1] <= median(node.depth(dat_tr)[node.depth(dat_tr) > 1]))
+
+    ## Make NJ trees for each window
+    win_tr <- purrr::map2(win_dist, pos_out, function(y,z){
+      print(z)
+      # Filter out comparisons that are only NA
+      y <- as.matrix(y)
+      y <- y[rowSums(y, na.rm = TRUE) > 0, colSums(y, na.rm = TRUE) > 0]
+      tree <- bionjs(y)
+      tree <- fix_negative_edge_length(tree, collapse_multi = TRUE)
+    })
+      
+    #Proportion of species that are monophyletic.
+    win_mono <- win_tr %>%
+      purrr::map(~{
+        tibble(spp = unique(spp_names), 
+               mono = monophyly(.x, spp_names)) %>%
+          left_join(full_mono %>% dplyr::rename(full_mono = mono), by="spp") %>%
+          mutate(mono_both = mono == full_mono)
+      })
+    
+    # Get the proportion of monophyletic spp only counting ones monophyletic on full tree 
+    win_mono_comp <- win_mono %>%
+      purrr::map_dbl(~{
+        length(which(.x$mono_both))/length(.x$mono_both)
+      })
+    # Get total proportion of monophyletic spp
+    win_mono_all <- win_mono %>%
+      purrr::map_dbl(~{
+        length(which(.x$mono))/length(.x$mono)
+      })
+    
+    #NN
+    win_nn <- win_dist %>%
+      purrr::map(~{
+        tibble(seqs = names(seqs),
+               spp = spp_names, 
+               nn = nearNeighbour(.x, spp_names)) %>%
+          left_join(full_nn %>% dplyr::rename(full_nn = nn), by="spp") %>%
+          mutate(nn_both = nn == full_nn)
+      })
+    
+    # Get the proportion of successful ID's only counting ones successful with full-length 
+    win_nn_comp <- win_nn %>%
+      purrr::map_dbl(~{
+        length(which(.x$nn_both))/length(.x$nn_both)
+      }) 
+    # Get total proportion of successful ID's
+    win_nn_all <- win_nn %>%
+      purrr::map_dbl(~{
+        length(which(.x$nn))/length(.x$nn)
+      })
+    
+    # threshID
+    #win_threshid <- lapply(win_dist, function(x) threshID(x, spp_names, threshold = 0.01))
+    
+    window_results[[w]] <- data.frame(
+      win_length = win_length[w],
+      pos = pos_out,
+      diag = nd_out,
+      k2p_dist = dist_mean_out,
+      mono_comp = win_mono_comp,
+      mono_all = win_mono_all,
+      nn_comp = win_nn_comp,
+      nn_all = win_nn_all,
+      n_seqs = length(seqs),
+      n_spp = length(unique(spp_names))
+    )%>%
+      mutate(
+       #tree = list(win_tr),
+        win_mono = win_mono,
+        win_nn = win_nn)
+  }
+  
+  # Calculate entropy
+  ent <- taxreturn::alignment_entropy(as.list(seqs), maskgaps=1, countgaps=FALSE, 
+                                        method="ML", unit="log", return_extra = TRUE) %>%
+      ungroup() %>%
+      mutate(ent = ent %>% 
+               na_if("") %>%
+               replace_na(0)) %>%
+      mutate(ent_ma = ma(ent, n = win_int, sides=1)) %>%
+      mutate(ent_ma = ent_ma %>% replace_na(0)) %>%
+    mutate(pos = as.numeric(pos))
+  
+  # Create output
+  out <- window_results  %>%
+    bind_rows() %>%
+    right_join(ent) 
+  return(out)
+})
+
+sw_merged <- sw_results %>%
+  bind_rows(.id = "source") %>%
+  mutate(source = source %>% 
+             str_remove("_aligned.*$") %>%
+             str_remove("^.*/"))
+
+#saveRDS(sw_merged, "sw_merged.rds")
+
+sw_merged <- readRDS("sw_merged.rds")
+# Could maybe put them all on the same grid?
+
+# All on one plot
+sw_merged %>%
+  filter(is.finite(k2p_dist)) %>%
+  pivot_longer(c("diag", "k2p_dist", "mono_comp"),
+               names_to="metric",
+               values_to="value") %>%
+  group_by(metric) %>%
+  mutate(prop = value / sum(value) * 100) %>%
+  mutate(z_norm = znorm(value)) %>%
+  ungroup()%>%
+  ggplot(aes(x = pos, y = z_norm, colour=metric, group=metric))+
+  geom_line() + 
+  theme_bw()+
+  facet_grid(source~win_length, scales="free", space="free")+
+      scale_x_continuous(expand=c(0,0), breaks = seq(0, max(sw_merged$pos), 20))+
+      scale_y_continuous(expand=c(0,0)) +
+  theme(panel.grid = element_blank())
+  
+# Just tree monophyly comparison
+sw_merged %>%
+  filter(is.finite(k2p_dist)) %>%
+  pivot_longer(c("mono_comp", "nn_comp"),
+               names_to="metric",
+               values_to="value") %>%
+  #group_by(metric) %>%
+ # mutate(prop = value / sum(value) * 100) %>%
+  #mutate(z_norm = znorm(value)) %>%
+  ungroup()%>%
+  ggplot(aes(x = pos, y = value, colour=metric))+
+  geom_line() + 
+  theme_bw()+
+  facet_grid(source~win_length)+
+      scale_x_continuous(expand=c(0,0), breaks = seq(0, max(sw_merged$pos), 20))+
+      scale_y_continuous(expand=c(0,0), limits=c(0,1), labels = scales::percent_format()) +
+  theme(panel.grid = element_blank())
+
+# Just nearest neighbour comparison
+sw_merged %>%
+  filter(is.finite(k2p_dist)) %>%
+  pivot_longer(c("nn_comp", "nn_all"),
+               names_to="metric",
+               values_to="value") %>%
+  #group_by(metric) %>%
+ # mutate(prop = value / sum(value) * 100) %>%
+  #mutate(z_norm = znorm(value)) %>%
+  ungroup()%>%
+  ggplot(aes(x = pos, y = value, colour=metric))+
+  geom_line() + 
+  theme_bw()+
+  facet_grid(source~win_length)+
+      scale_x_continuous(expand=c(0,0), breaks = seq(0, max(sw_merged$pos), 20))+
+      scale_y_continuous(expand=c(0,0), limits=c(0,1), labels = scales::percent_format()) +
+  theme(panel.grid = element_blank())
+
+# Just diagnostic nucleotides
+sw_merged %>%
+  filter(is.finite(k2p_dist)) %>%
+  pivot_longer(c("diag"),
+               names_to="metric",
+               values_to="value") %>%
+  #group_by(metric) %>%
+ # mutate(prop = value / sum(value) * 100) %>%
+  #mutate(z_norm = znorm(value)) %>%
+  ungroup()%>%
+  ggplot(aes(x = pos, y = value))+
+  geom_line() + 
+  theme_bw()+
+  facet_grid(source~., scales="free_y")+
+      scale_x_continuous(expand=c(0,0), breaks = seq(0, max(sw_merged$pos), 50))+
+  theme(panel.grid = element_blank()) +
+  labs(x = "Window starting position", y = "Diagnostic nucleotides")
+```
+
+
+## SW gifs
+
+```{r sw gif}
+# Make directory for gifs
+dir.create("gifs")
+
+# Set window parameters
+win_length <- 220
+win_int <- 20
+
+fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
+  purrr::map(function(x){
+  print(x)
+  seqs <- insect::readFASTA(x)
+  
+  loci_name <- x %>% str_remove(".*/") %>% str_remove("_.*$")
+
+  spp_names <- names(seqs) %>%
+    str_remove("_*(?!.*_).*$") 
+  
+  # Sliding window analyses
+  dat <- as.matrix(seqs)
+  dimnames(dat)[[1]] <- spp_names
+  
+  # Make full distance matrix
+  datd <- dist.dna(dat, pairwise.deletion = TRUE)
+
+  # Create windows
+  win <- slidingWindow(dat, width=win_length, interval = win_int)
+  pos_out <- sapply(win, function(x) attr(x, "window")[1])
+  
+  # Create distance matrices for each window
+  win_dist <- lapply(win, function(x) dist.dna(x, pairwise.deletion = TRUE))
+
+  ## Make NJ trees for each window
+  win_tr <- purrr::map2(win_dist,pos_out, function(y,z){
+    print(z)
+    # Filter out comparisons that are only NA
+    y <- as.matrix(y)
+    y <- y[rowSums(y, na.rm = TRUE) > 0, colSums(y, na.rm = TRUE) > 0]
+    tree <- njs(y)
+    
+    if(!all(is.finite(tree$edge.length))) {return(NULL)}
+
+     p1 <- ggtree(tree)    
+    
+    # Highlight monophyletic taxa
+    mono <- p1$data %>% 
+      left_join(data.frame( label = unique(spp_names),
+                        mono = monophyly(tree, spp_names)), by="label")
+    p2 <- p1 %<+% mono + 
+      geom_tippoint(aes(colour=mono)) +
+      theme(legend.position = "top")+
+      labs(colour = "Monophyletic",
+           title = loci_name) +
+      scale_colour_manual(values=c("#e41a1c","#4daf4a"))
+    
+    # Create SW visualisation
+    sw_plot <- enframe(seq(1,ncol(dat), 1), name = NULL, value="pos") %>%
+      mutate(in_win = between(pos, z, z+ win_length)) %>%
+      ggplot(aes(x = pos, y = 1, fill=in_win)) +
+      geom_tile() +
+      scale_x_continuous(expand=c(0,0), breaks = seq(0, ncol(dat), 50))+
+      scale_y_continuous(expand=c(0,0)) +
+      scale_fill_manual(values = c("grey80","firebrick"))+
+      theme(axis.text.y  = element_blank(),
+            axis.ticks.y = element_blank(),
+            axis.title.y = element_blank(),
+            legend.position = "none") +
+      labs(x = "Nucleotide position")
+      
+    out <- p2 / sw_plot + plot_layout(heights = c(20,1))
+    
+    return(out)
+  })
+  
+ # Remove failed plots
+ win_tr <- win_tr[!sapply(win_tr, is.null)]
+
+ out_name <- normalizePath(paste0("gifs/", loci_name ,"_windows.gif"))
+ 
+ # Plot gif
+ animation::saveGIF(
+   expr = {
+    purrr::walk(win_tr, ~{
+      plot(.x)
+    })
+   },
+   movie.name = out_name,
+   ani.width=620 ,
+   ani.height=877,
+   interval=2,
+   autobrowse=FALSE
+ )
+ try(dev.off(), silent=TRUE)
+  
+})
+
+```
+
+
+# USEARCH Sliding window
+
+## Sliding window PCR
+
+```{r make windows}
+# Load seqs
+seqs <- readDNAStringSet("reference/merged_final.fa.gz")
+seqs <- seqs[lengths(seqs)==712]
+
+# Make sliding window alignments
+dir.create("diagnostic_alignments/windows")
+
+fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
+  purrr::map(function(x){
+  seqs <- readDNAStringSet(x)
+  seqs <- seqs[lengths(seqs)==width(seqs)]
+  
+  # Get locus name
+  locus <- basename(as.character(x)) %>% str_remove("_aligned.fa")
+  
+  # Make 200bp windows
+  alignment_sw(seqs, width=200, interval=3, maxgaps=9) %>%
+    purrr::map2(., names(.), ~Biostrings::writeXStringSet(.x, file=paste0("diagnostic_alignments/windows/",locus,"_win200_" .y,".fa.gz"), compress=TRUE))
+  
+  # Make 300bp windows
+  alignment_sw(seqs, width=300, interval=3, maxgaps=9) %>%
+    purrr::map2(., names(.), ~Biostrings::writeXStringSet(.x, file=paste0("diagnostic_alignments/windows/",locus,"_win300_" .y,".fa.gz"), compress=TRUE))
+  
+  dir.create("primer_evaluation/amplicons/win400/")
+  alignment_sw(seqs, width=400, interval=3, maxgaps=9) %>%
+    purrr::map2(., names(.), ~Biostrings::writeXStringSet(.x, file=paste0("diagnostic_alignments/windows/",locus,"_win400_" .y,".fa.gz"), compress=TRUE))
+  })
+  
+
+```
+ 
+ 
+## USEARCH distance matrix
+
+```{bash}
+#!/bin/bash
+dos2unix bash/usearch_distmat.sh
+/usr/bin/ls -d /group/pathogens/Alexp/Metabarcoding/primer_evaluation/primer_evaluation/amplicons/win*/* | sed -e '1p' -e '/.fa.gz/!d' | sort -u > job_index.txt
+njobs=$(cat job_index.txt | wc -l)
+sbatch --array=1-$njobs bash/usearch_distmat.sh
+```
+
+
+# SW results
+
+```{r sw results}
+
+# Get mixed clusters
+library(furrr)
+plan(multiprocess, workers=8)
+sw_clusters <- c(fs::dir_ls(path="primer_evaluation/amplicons/win200/usearch_output/", glob = "*.txt.gz"),
+                    fs::dir_ls(path="primer_evaluation/amplicons/win300/usearch_output/", glob = "*.txt.gz"),
+                    fs::dir_ls(path="primer_evaluation/amplicons/win400/usearch_output/", glob = "*.txt.gz")) %>%
+  furrr::future_map(function(x){
+  #purrr::map(function(x){
+  vroom::vroom(x, delim="\t", col_names = c("acc1", "acc2", "dist")) %>%
+    dplyr::mutate(spp1 = acc1 %>%
+                    str_remove(";$") %>%
+                    str_remove("^.*;"),
+                  acc1 = acc1 %>% str_remove(";.*$"),
+                  spp2 = acc2 %>%
+                    str_remove(";$") %>%
+                    str_remove("^.*;"),
+                  acc2 = acc2 %>% str_remove(";.*$"),
+                  dist = round(dist, 2)) %>%
+    dplyr::filter(dist %in% c(0.03, 0.02,0.01, 0)) %>%
+    dplyr::filter(!spp1==spp2) %>%
+    dplyr::mutate(id_0.97 = case_when(dist <=0.03~ TRUE, TRUE ~ FALSE),
+                  id_0.98 = case_when(dist <=0.02~ TRUE, TRUE ~ FALSE),
+                  id_0.99 = case_when(dist <=0.01~ TRUE, TRUE ~ FALSE),
+                  id_1 = case_when(dist == 0~ TRUE, TRUE ~ FALSE)) %>%
+  pivot_longer(cols = starts_with("id"),
+               names_to = "threshold",
+               values_to= "outcome") %>%
+  mutate(threshold = threshold %>% str_remove("id_")) %>%
+  filter(outcome == TRUE)  %>%
+        dplyr::group_by(threshold) %>% 
+        dplyr::summarise(mixed=n_distinct(spp1))
+    
+  })%>%
+  bind_rows(.id="source") %>%
+  mutate(source = str_remove(basename(source), ".txt.gz")) %>%
+  mutate(win_start = source %>% str_remove("-.*$")  %>% as.numeric(),
+         win_end = source %>% str_remove("^.*-") %>% as.numeric()) %>%
+  mutate(win_length = win_end - win_start)
+  
+#Get amplified
+amplified <-c(fs::dir_ls(path="primer_evaluation/amplicons/win200/", glob = "*.fa.gz"),
+              fs::dir_ls(path="primer_evaluation/amplicons/win300/", glob = "*.fa.gz"),
+              fs::dir_ls(path="primer_evaluation/amplicons/win400/", glob = "*.fa.gz")) %>%
+   purrr::map(function(x){
+   #furrr::future_map(function(x){
+     fasta.index(x) %>%
+        mutate(species = desc %>% 
+                 str_remove("(?:[^;]*;){7}") %>% #match 7th ;
+                 str_remove(";$"))  %>%
+      dplyr::group_by(filepath) %>%
+      dplyr::summarise(seqs_amplified = n(), spp_amplified = n_distinct(species)) 
+   }) %>%
+  bind_rows() %>%
+  mutate(source = str_remove(basename(filepath), ".fa.gz")) %>%
+  dplyr::select(-filepath)
+
+sw_joint <- sw_clusters %>%
+  left_join(amplified) 
+vroom::vroom_write(sw_joint, "primer_evaluation/amplicons/sw_clusters_summary2.csv", delim=",")
+
+# Read in
+sw_joint <- vroom::vroom("primer_evaluation/amplicons/sw_clusters_summary2.csv", delim=",") %>%
+  mutate(pos = win_start) %>%
+  mutate(success =  (spp_amplified - mixed)/spp_amplified)
+
+# New plot
+sw_means <- sw_joint %>%
+  filter(win_start > 25, win_end < (712-26)) %>%
+  group_by(source, threshold) %>%
+  group_split() %>%
+  purrr::map(function(x){
+    x %>% dplyr::slice(rep(1:n(), each = unique(x$win_length))) %>%
+      mutate(pos = seq(unique(x$win_start) , (unique(x$win_end)-1), 1))
+  }) %>%
+  bind_rows() %>%
+  ungroup() %>%
+  group_by(threshold, pos, win_length) %>%
+  summarise(success = mean(success))
+
+gg.swid <- sw_means %>%
+    filter(threshold == 0.97) %>%
+    ggplot(aes(x = pos, y=1)) +
+      geom_tile(aes(fill=success))+
+      scale_fill_viridis_c(option="plasma", labels = scales::percent) + 
+    facet_wrap(win_length ~., ncol=1, strip.position ="left") +
+    scale_x_continuous(limits = c(0, 712), breaks=seq(0,700,50), expand=c(0,0))  +
+    theme_void() +
+    theme(legend.position = "right",
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank()) +
+  labs(fill = "% Identified",
+       y = "Window size")
+
+
+Fig2 <-  gg.primers / gg.entropy / gg.swid / gg.sequences  + plot_layout(heights= c(3, 3, 2, 0.5))   +  plot_annotation(tag_levels = 'A') 
+
+
+pdf(file="fig/Fig2_COI_overview.pdf", width = 11, height = 8 , paper="a4r")
+  plot(Fig2)
+try(dev.off(), silent=TRUE)
+
+# Regression
+sw_means %>%
+  ggplot(aes(x=pos, y=success))+
+  geom_point(alpha=0.2)+
+  geom_smooth(method="lm")+
+  facet_grid(threshold~win_length)
+
+sw_means %>%
+  group_by(threshold,win_length) %>%
+  nest() %>%
+  mutate(fit_lm = purrr::map(data, ~lm(success~pos, data = .)),
+         coef_info = purrr::map(fit_lm, broom::tidy)) %>%
+  unnest(coef_info) %>%
+  View() 
+
+```
+
+# Primer design 
+
+Rules:
+2 GC bases
+Think about the length of your primers (20-25 bp is usually ideal) and the region you’re copying
+Aim for a GC content of 40-60 %
+Pay particular attention to the 3′ end, especially with Gs and Cs
+Avoid repeats of one or two bases more than four times
+Ideally keep the melting temperature around the 60 °C mark
+Try to keep the melting temperatures within 5 °C between the forward and reverse
+Check for self-dimerisation or dimerisation between the forward and reverse
+Consider degenerate bases (but not too many)
+
+ 
+# Identification success for each primer set
+
+- Chop the alignment to the region amplified
+- Calculate the differentiation at a giver percentage ID
+- Make a tree + heatmap for each indivuald primer, colour by whether its correctly identified or not
+
+# Identification success for multiple loci
+
+- Calculate all possible cobinations of loci
+- Create a tree + heatmap for whether each combination can correctly identify each taxa
+
+
+# Sequence logos
+
+```{r Create sequence logos}
+library(ggseqlogo)
+
+seq_logos <- fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
+  purrr::map(function(x){
+    seqs <- dna2char(insect::readFASTA(x))
+    ggplot() + 
+      geom_logo(seqs) + 
+      theme_logo() +
+      labs(title = x %>% 
+             str_remove("_aligned.*$") %>%
+             str_remove("^.*/")) +
+      scale_x_continuous(expand=c(0,0), breaks = seq(0, max(sapply(seqs, nchar)), 10))+
+      scale_y_continuous(expand=c(0,0))
+  })
+
+gg.seq_logos <- wrap_plots(seq_logos, ncol=1)
+
+
+pdf(file="fig/seq_logos.pdf", width = 50, height = 8)
+  plot(gg.seq_logos)
+try(dev.off(), silent=TRUE)
+
+```
+
+
+
+# Predicted mismatch
+
+```{r Primerminer, message=FALSE}
+library(PrimerMiner)
+## Target sequences to test against
+seqs <- insect::readFASTA("reference/merged_final.fa.gz")
+names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
+writeFASTA(seqs, "primer_evaluation/merged_final_target.fa")
+
+target <- "primer_evaluation/merged_final_target.fa"
+
+# Load primers
+primers <- read_csv("primer_evaluation/primer_candidates.csv") %>%
+  mutate(seq = str_replace_all(seq, "I","N")) %>% 
+  select(-score, -issues)
+
+dir.create("primer_evaluation/PrimerMiner")
+
+for (i in 1:nrow(primers)) {
+  if(primers$strand[i]=="F"){
+  evaluate_primer(target,
+   as.character(primers$seq[i]), primers$start[i], primers$end[i],
+   forward = TRUE, gap_NA = TRUE, N_NA=TRUE,
+   mm_position = "Position_v1", mm_type = "Type_v1", adjacent = 2,
+   save = paste0("primer_evaluation/PrimerMiner/", primers$name[i],".csv")
+  )
+  } else if(primers$strand[i]=="R"){
+  evaluate_primer(target,
+   as.character(primers$seq[i]), primers$start[i], primers$end[i],
+   forward = FALSE, gap_NA = TRUE, N_NA=TRUE,
+   mm_position = "Position_v1", mm_type = "Type_v1", adjacent = 2,
+   save = paste0("primer_evaluation/PrimerMiner/", primers$name[i],".csv")
+  )
+ }
+}
+
+# gZip files
+fs::dir_ls(path="primer_evaluation/PrimerMiner", glob = "*.csv") %>%
+  purrr::map(R.utils::gzip)
+
+```
+
+```
