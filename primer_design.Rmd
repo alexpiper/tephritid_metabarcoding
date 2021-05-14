@@ -9,6 +9,10 @@ editor_options:
 ---
 
 # Introduction
+cd /group/pathogens/Alexp/Metabarcoding/tephritid_metabarcoding
+sinteractive --ntasks=1 --cpus-per-task=10 --mem-per-cpu=10GB --time=48:00:00
+module load R/4.0.0-foss-2020a
+module load GDAL/3.0.2-foss-2019a-Python-3.7.2
 
 # Load packages
 ```{r setup}
@@ -23,12 +27,12 @@ editor_options:
                     "seqinr",
                     "patchwork",
                     "ShortRead",
-                    "foreach",
-                    "doParallel",
+                    "furrr",
+                    "future",
                     "TmCalculator",
                     "castor",
                     "phangorn",
-                    "furrr")
+                    "tidytext")
 
 .bioc_packages <- c("DECIPHER",
                     "ggtree",
@@ -50,8 +54,10 @@ sapply(c(.cran_packages,.bioc_packages), require, character.only = TRUE)
 
 # Github packages
 devtools::install_github("alexpiper/taxreturn")
+devtools::install_github("ricardo-bion/ggradar",dependencies = TRUE)
 library(taxreturn)
 library(PrimerMiner)
+library(ggradar)
 
 # SOurce internal functions
 source("R/themes.R")
@@ -98,12 +104,12 @@ fetchSeqs("Tephritidae", database="genbank", out.dir="diagnostic_alignments/publ
 # Not published yet: https://www.biorxiv.org/content/10.1101/2020.11.23.394510v1
 ```
 
-# Reformat inhouse seuqence names
+# Reformat inhouse sequence names
 
+Also remove terminal gaps
 ```{r reformat inhouse}
-
 # Get NCBI reference database
-db <- taxreturn::get_ncbi_lineage()
+db <- taxreturn::get_ncbi_taxonomy()
 
 dir.create("diagnostic_alignments/inhouse")
 fs::dir_ls(path="diagnostic_alignments", glob = "*Bactrocera_*.fa*|*Melissa*.fa*") %>%
@@ -127,6 +133,9 @@ fs::dir_ls(path="diagnostic_alignments", glob = "*Bactrocera_*.fa*|*Melissa*.fa*
       pull(names)
 
     names(seqs) <- new_names
+    
+    # These seqs also have terminal N's instead of gaps. Replace these
+    seqs <- replace_terminal_N(seqs)
     writeXStringSet(seqs, filepath = paste0("diagnostic_alignments/inhouse/", basename(as.character(x))))
   })
 
@@ -135,38 +144,39 @@ fs::dir_ls(path="diagnostic_alignments", glob = "*Bactrocera_*.fa*|*Melissa*.fa*
 
 # Create PHMMs
 
-Use only the validated diagnostic allignments to make the PHMMS
+Use only the validated diagnostic alignments to make the PHMMS
 
 ```{r create PHMMS}
 dir.create("diagnostic_alignments/model")
 fs::dir_ls(path="diagnostic_alignments", glob = "*Bactrocera_*.fa") %>%
   purrr::map(function(x){
+    loci_name <- basename(as.character(x)) %>% 
+      str_remove("^.*_") %>%
+      str_remove(".fa")
+    
     # Align all sequences
     aligned <- readDNAStringSet(x) %>%
-      replaceAmbiguities("-") %>%
+      replace_terminal_N() %>%
       RemoveGaps()%>%
       AlignSeqs()
     
-    # Filter short sequences
-    aligned <- aligned[letterFrequency(aligned, "ACGT") > 200]
+    # Remove sequences with >50% gaps
+    aligned <- aligned[letterFrequency(aligned, "ACGT") > (width(aligned[1]) / 2)]
     
-    # Filter for stop codons
-    aligned <- taxreturn::codon_filter(aligned)
+    # Filter for stop codons - NEED TO MAKE THIS DEAL WITH Ambiguities
+    aligned <- taxreturn::codon_filter(aligned, genetic_code = ifelse(loci_name == "COI", "SGC4", "SGC0"), tryrc = TRUE, resolve_draws = "majority")
     
-    #Write out aligned sequences
-    #writeXStringSet(aligned, filepath= x %>% str_replace_all("merged", "aligned"), append=TRUE, width=20000)
-  
+    #BrowseSeqs(aligned)
+    
     # Create PHMM
-    model <- aphid::derivePHMM(as.DNAbin(aligned))
+    model <- aphid::derivePHMM(as.DNAbin(aligned), omit.endgaps = TRUE, seqweights="Gerstein")
+  
     saveRDS(model, paste0(dirname(as.character(x)), "/model/", basename(as.character(x)) %>% str_replace(".fa", ".rds") %>% str_replace(".fa.gz", ".rds")))
-    
 })
 ```
 
 
 # Merge all sequences
-
-Going to need t ofix fthe formatting of the inhouse ones
 
 ```{r merge alignments}
 dir.create("diagnostic_alignments/merged")
@@ -177,29 +187,32 @@ merge_seqs <- function(path, glob, out){
   file.create(out)
   files <- fs::dir_ls(path=path, glob = glob) 
   message("merging ", length(files), " fasta files")
+  
+  if(str_detect(out, ".gz"))(compress = TRUE)
   files %>%
   purrr::map(readDNAStringSet) %>%
-  purrr::map(writeXStringSet, filepath=out, append=TRUE, width=20000)
+  purrr::map(writeXStringSet, filepath=out, append=TRUE, width=20000, compress=compress)
 }
 
 #COI
-merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*COI*.fa*|*mitochondria*.fa*", out = "diagnostic_alignments/merged/COI_merged.fa")
+merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*COI*.fa*|*mitochondria*.fa*", out = "diagnostic_alignments/merged/COI_merged.fa.gz")
   
 # EIF3L
-merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*EIF3L*.fa*", out = "diagnostic_alignments/merged/EIF3L_merged.fa")
+merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*EIF3L*.fa*", out = "diagnostic_alignments/merged/EIF3L_merged.fa.gz")
 
 # DDOST
-merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*DDOST*.fa*", out = "diagnostic_alignments/merged/DDOST_merged.fa")
+merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*DDOST*.fa*", out = "diagnostic_alignments/merged/DDOST_merged.fa.gz")
 
 # POP4
-merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*POP4*.fa*", out = "diagnostic_alignments/merged/POP4_merged.fa")
+merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*POP4*.fa*", out = "diagnostic_alignments/merged/POP4_merged.fa.gz")
 
 # RPA2
-merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*RPA2*.fa*", out = "diagnostic_alignments/merged/RPA2_merged.fa")
+merge_seqs(path=c("diagnostic_alignments/inhouse","diagnostic_alignments/public"), glob="*RPA2*.fa*", out = "diagnostic_alignments/merged/RPA2_merged.fa.gz")
 
-# fix names and filter
-alignments_cleaned <- fs::dir_ls(path="diagnostic_alignments/merged/", glob = "*.fa") %>%
+# fix names, replace N's with gapsr
+alignments_cleaned <- fs::dir_ls(path="diagnostic_alignments/merged/", glob = "*.fa*") %>%
   purrr::map(readDNAStringSet) %>%
+  purrr::map(replaceAmbiguities, "-") %>%
   purrr::map(~{
     new_names <- names(.x) %>%
       str_replace_all("Bactrocera_unitaeneola", "Bactrocera_unitaeniola") %>%
@@ -213,115 +226,101 @@ alignments_cleaned <- fs::dir_ls(path="diagnostic_alignments/merged/", glob = "*
   
 alignments_cleaned %>%
   purrr::map2(names(alignments_cleaned), function(x,y){
-    writeXStringSet(x, filepath=y, append=FALSE, width=20000)
+    writeXStringSet(x, filepath=y, append=FALSE, width=20000,compress = TRUE)
   })
 
 ```
 
-# Remove taxa without binomials
+# Filter sequences
 
-# Align to PHMM
-
-```{r }
-dir.create("diagnostic_alignments/aligned")
-
-# Test PHMM with tephritid mitogenomes
-
-model <- readRDS("diagnostic_alignments/model/Bactrocera_COI.rds")
-
-seqs <- insect::readFASTA("diagnostic_alignments/public/Tephritidae_mitochondria.fa.gz")
-
-seqs <- seqs[1:10]
-
-filtered <- taxreturn::map_to_model(seqs,  model, minscore = 100,
- shave=TRUE, check_indels=TRUE,  maxNs = 0,
- multithread=FALSE, quiet=FALSE, progress = FALSE)
-
-
-model <- readRDS("reference/folmer_fullength_model.rds")
-seqs <- insect::readFASTA("reference/database_builder/04_name_filtered.fa.gz")
-
-#Write out results filtered results
-insect::writeFASTA(filtered, file="reference/database_builder/05_filtered.fa.gz",compress=TRUE)
-
-
-```
-
-## Remove stop codons
-
-```{r stop codons}
-filtered <- insect::readFASTA("reference/database_builder/05_filtered.fa.gz")
-
-# Filter for stop codons
-codonfilt <- taxreturn::codon_filter(filtered)
-
-#Write out results filtered results
-insect::writeFASTA(codonfilt, file="reference/database_builder/06_codon_filtered.fa.gz",compress=TRUE)
-```
-
-# Filter for length
-
-# remove chimeric sequences
-
-TODO!
-
-# Check for mixed clusters
-
-```{r Mixed clusters}
-codonfilt <- insect::readFASTA("reference/database_builder/06_codon_filtered.fa.gz")
-
-# Remove duplicate accesions
-seqs <- insect::subset.DNAbin(codonfilt, subset = !duplicated(str_extract(names(codonfilt), "^.*\\|" )))
-
+```{r filter seqs}
 # flag clusters with mixed taxonomy at different cluster thresholds and taxonomic ranks
-db <- taxreturn::get_ott_taxonomy(dir="ott3.2")
+db <- taxreturn::get_ncbi_taxonomy()
+ncores <- 10
 set.seed(666)
 
-mixed_clusters <- purrr::map_dfr(rev(seq(0.95, 1, 0.01)), ~taxreturn::get_mixed_clusters(
-    x = seqs, db=db,
-    rank = c("species","genus","family"),
-    threshold = .x,
-    return = "consensus",
-    confidence=0.6, quiet = FALSE) 
-)
-write.csv(mixed_clusters,"mixedclusters.csv")
+#x <- fs::dir_ls(path="diagnostic_alignments/merged", glob = "*.fa.gz*")[[1]]
+to_remove <- readLines("diagnostic_alignments/mislabelled.txt")
 
-mixed_clusters <- vroom::vroom("reference/mixedclusters.csv")
+dir.create("diagnostic_alignments/cleaned")
+filt <- fs::dir_ls(path="diagnostic_alignments/merged", glob = "*.fa.gz")%>%
+  purrr::map(function(x){
+    loci_name <- basename(as.character(x)) %>% 
+      str_remove("_.*$")
+    
+    seqs <- insect::readFASTA(x)
+    #seqs <- seqs[1:100]
 
-gg.mixed <- mixed_clusters %>%
-  group_by(threshold, rank) %>%
-  summarise(n=n()) %>%
-  ggplot(aes(x=as.factor(threshold), y=n, fill=rank, group=rank)) + 
-  geom_bar(stat="identity", position="dodge", colour="black") +
-  xlab("Clustering threshold") +
-  ylab("Problem Sequences") +
-  ggtitle("Mixed clusters") +
-  theme_classic() +
-  scale_fill_brewer(name = "Taxonomic Rank", palette="Greens") 
+    # Remove any duplicated sequence accessions
+    uniqSeqs <- seqs[!duplicated(str_remove(names(seqs), "\\|.*$"))]
+    
+    # Resolve taxonomic synonyms
+    resolved <- resolve_synonyms_ncbi(uniqSeqs )
+    
+    #Check names difference
+    #names(uniqSeqs)[which(!names(uniqSeqs) %in% names(resolved))]
+    #names(resolved)[which(!names(resolved) %in% names(uniqSeqs))]
+    
+    # Filter sequeunces with bad names
+    seqnames <- names(resolved) %>% str_remove("^.*;")
+    names(resolved)[str_detect(seqnames, "sp\\.|spp\\.|aff\\.|nr\\.|bv\\.|cf\\.|nom\\.|nud\\.|environment|undescribed|unverified|unclassified|uncultured|unidentif|[0-9]|[:punct:]")] <- NA
+    namefilt <- resolved[!is.na(names(resolved))]
+    
+    # Filter out putatively mislabelled seqs
+    resolved <- resolved[!names(resolved) %in% to_remove]
+    
+    #load phmm
+    model <- readRDS(fs::dir_ls(path="diagnostic_alignments/model", glob = paste0("*",loci_name,"*")))
+    
+    # Align to phmm
+    #ifelse(loci_name == "COI", TRUE, FALSE)
+    filtered <- taxreturn::map_to_model(namefilt,  model, min_score = 100,
+     shave=TRUE, trim_ends = 4, check_frame=TRUE,  max_N = 5, max_gap=(model$size/3), extra="drop", kmer_threshold = 0.3, k = 5,
+     multithread=ncores, quiet=FALSE, progress = FALSE)
+    
+    # Check for stop codons
+    codonfilt <- taxreturn::codon_filter(filtered, genetic_code = ifelse(loci_name == "COI", "SGC4", "SGC0"), tryrc = TRUE, resolve_draws = "majority")
+    
+    # Check for mixed clusters (misannotated sequences)
+    mixed_clusters <- taxreturn::get_mixed_clusters(codonfilt, db, rank="species", threshold=0.99, return="consensus", confidence=0.8, quiet=FALSE)
+    purged  <- subset.DNAbin(codonfilt, subset = !str_replace(names(codonfilt), "(?:.(?!;))+$", "") %in% mixed_clusters$Acc)
+ 
+    # prune overrepresented groups
+    pruned <- taxreturn::prune_groups(purged, max_group_size = 5, discardby = "length", dedup = TRUE, quiet = FALSE)
+	
+	  #Write out results filtered results
+    insect::writeFASTA(pruned, file=paste0("diagnostic_alignments/cleaned/", loci_name, ".fa.gz"), compress=TRUE)
 
-gg.mixed
+    # Return number of filtered sequences
+    out <- tibble(
+      loci = loci_name,
+      seqs = length(seqs),
+      uniqseqs = length(uniqSeqs),
+      namefilt = length(namefilt),
+      phmm = length(filtered),
+      codonfilt = length(codonfilt),
+      purged = length(purged),
+      pruned = length(pruned)
+      
+    )
+    return(out)
+})%>%
+  bind_rows()
 
-# Purge all with mixed genus at 97, with confidence > 0.6  - >0.8 is probably better - Could i justify this with a probability of lowest common anestor?
-rem <- mixed_clusters %>% 
-  mutate(rem = case_when(
-    rank=="species" & threshold >=0.99 & confidence > 0.8 ~ TRUE,
-    rank=="genus" & threshold >=0.97 & confidence > 0.8 ~ TRUE,
-    rank=="family" & threshold >=0.95 & confidence > 0.8 ~ TRUE,
-    TRUE  ~ FALSE
-    ))%>%
-  filter(rem==TRUE) %>%
-  pull(Acc) %>%
-  unique()
+write_csv(filt, "filter_stats.csv")
 
-length(rem)
+filt <- read_csv("filter_stats.csv")
 
-purged  <- subset.DNAbin(seqs, subset = !str_replace(names(seqs), "(?:.(?!;))+$", "") %in% rem)
-insect::writeFASTA(purged, file="reference/database_builder/07_purged.fa.gz", compress=TRUE)
+filt %>%
+  pivot_longer(-loci,
+               names_to="step",
+               values_to="seqs") %>%
+  mutate(step = factor(step, levels=c("seqs", "uniqseqs", "namefilt", "phmm", "codonfilt", "purged"))) %>%
+  ggplot(aes(x = step, y = seqs))+
+  geom_col()+
+  facet_grid(loci~., scales="free_y")
+
 ```
-
-# Blast against contaminants
-
-# prune overrepresented groups
 
 # Entropy
 
@@ -334,10 +333,10 @@ ma <- function(x, n=3, sides=2){
 
 
 # Entropy & Basecomp bar plots
-entropy_plots <- fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
+entropy_plots <- fs::dir_ls(path="diagnostic_alignments/cleaned", glob = "*.fa.gz") %>%
   purrr::map(function(x){
     seqs <- insect::readFASTA(x)
-    ent <- taxreturn::alignment_entropy(as.list(seqs), maskgaps=1, countgaps=FALSE, 
+    ent <- taxreturn::alignment_entropy(as.list(seqs), mask_gaps=1, count_gaps=FALSE, 
                                         method="ML", unit="log", return_extra = TRUE) %>%
       ungroup() %>%
       mutate(ent = ent %>% 
@@ -391,34 +390,42 @@ try(dev.off(), silent=TRUE)
 
 # Sliding window analysis
 
+sinteractive --cpus-per-task=5 --mem-per-cpu=20GB --time=48:00:00
+module load R/4.0.0-foss-2020a
+module load GDAL/3.0.2-foss-2019a-Python-3.7.2
+
+
 ```{r sliding window}
 # Set window parameters
 win_length <- c(220, 420)
 win_int <- 3
 
-sw_results <- fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
-  purrr::map(function(x){
+future::plan(future::multiprocess(workers=8))
+
+sw_results <- fs::dir_ls(path="diagnostic_alignments/cleaned", glob = "*.fa.gz") %>%
+  furrr::future_map(function(x){
   print(x)
-  seqs <- insect::readFASTA(x)
+  seqs <- readDNAStringSet(x)
+  #seqs <- seqs[1:100]
   
   # species names
   spp_names <- names(seqs) %>%
-    str_remove("_*(?!.*_).*$") 
+    str_remove("^.*;")
+  names(seqs) <- spp_names
   
-  # Sliding window analyses
+  # Make a matrix
   dat <- as.matrix(seqs)
   dimnames(dat)[[1]] <- spp_names
-  
+
   # Make full distance matrix
-  datd <- dist.dna(dat, pairwise.deletion = TRUE)
+  datd <- DECIPHER::DistanceMatrix(seqs, includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
+                                   penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor", processors = 1, verbose = TRUE)
 
   # Create NJ tree from entire distance matrix
-  dat_tr <- bionjs(datd)
+  dat_tr <- bionjs(datd) # try njs, bionjs, nj, and bionj and see how it changes things
   
   # Fix any negative edge lengths
   dat_tr <- fix_negative_edge_length(dat_tr, collapse_multi = TRUE)
-  
- 
   
   # Identification success with full tree 
   full_mono <- tibble(spp = unique(spp_names), 
@@ -432,18 +439,24 @@ sw_results <- fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>
   for (w in 1:length(win_length)){
     
     # Create windows
-    win <- slidingWindow(dat, width=win_length[w], interval = win_int)
+    win <- alignment_sw(seqs, width= win_length[w], interval=win_int, maxgaps = 10)
+     
+    #win <- slidingWindow(seqs, width=win_length[w], interval = win_int)
     pos_out <- sapply(win, function(x) attr(x, "window")[1])
     
     # Create distance matrices for each window
-    win_dist <- lapply(win, function(x) dist.dna(x, pairwise.deletion = TRUE))
-  
+    win_dist <- lapply(win, function(x){
+      DECIPHER::DistanceMatrix(x, includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
+                                   penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor", processors = 1, verbose = FALSE)
+      
+    }) 
+    
     # Get mean K2P distance per window
     dist_mean_out <- sapply(win_dist, function(x) mean(x, na.rm = TRUE))
     
-    # Get number of diagnostic nucleotides      
-    nd_out <- slideNucDiag(dat, spp_names, width=win_length[w], interval = win_int)
-    nd_out <- colSums(nd_out)
+    # Get number of diagnostic nucleotides
+    #slideNucDiag(dat, spp_names, width=win_length[w], interval = win_int)
+    #nd_out <- colSums(nd_out)
     
     #depth <- which(node.depth(dat_tr)[node.depth(dat_tr) > 1] <= median(node.depth(dat_tr)[node.depth(dat_tr) > 1]))
 
@@ -501,10 +514,8 @@ sw_results <- fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>
     # threshID
     #win_threshid <- lapply(win_dist, function(x) threshID(x, spp_names, threshold = 0.01))
     
-    window_results[[w]] <- data.frame(
-      win_length = win_length[w],
+    window_results[[w]] <- data.frame(win_length = win_length[w],
       pos = pos_out,
-      diag = nd_out,
       k2p_dist = dist_mean_out,
       mono_comp = win_mono_comp,
       mono_all = win_mono_all,
@@ -513,29 +524,17 @@ sw_results <- fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>
       n_seqs = length(seqs),
       n_spp = length(unique(spp_names))
     )%>%
-      mutate(
-       #tree = list(win_tr),
-        win_mono = win_mono,
+      mutate(win_mono = win_mono,
         win_nn = win_nn)
   }
   
-  # Calculate entropy
-  ent <- taxreturn::alignment_entropy(as.list(seqs), maskgaps=1, countgaps=FALSE, 
-                                        method="ML", unit="log", return_extra = TRUE) %>%
-      ungroup() %>%
-      mutate(ent = ent %>% 
-               na_if("") %>%
-               replace_na(0)) %>%
-      mutate(ent_ma = ma(ent, n = win_int, sides=1)) %>%
-      mutate(ent_ma = ent_ma %>% replace_na(0)) %>%
-    mutate(pos = as.numeric(pos))
-  
   # Create output
   out <- window_results  %>%
-    bind_rows() %>%
-    right_join(ent) 
+    bind_rows()
   return(out)
-})
+},.options = furrr_options(seed=TRUE) )
+
+
 
 sw_merged <- sw_results %>%
   bind_rows(.id = "source") %>%
@@ -543,7 +542,8 @@ sw_merged <- sw_results %>%
              str_remove("_aligned.*$") %>%
              str_remove("^.*/"))
 
-#saveRDS(sw_merged, "output/rds/sw_merged.rds")
+saveRDS(sw_merged, "output/rds/sw_merged.rds")
+
 
 ```
 
@@ -640,30 +640,57 @@ best_windows <- sw_merged %>%
   #arrange(mono_comp, nn_comp) %>%
   slice_max(order_by=mono_comp, with_ties = TRUE) %>%
   slice_max(order_by=nn_comp, with_ties = TRUE) %>%
-  slice_max(order_by=diag, with_ties = TRUE) %>%
-  slice_max(order_by=k2p_dist, with_ties = TRUE)
+  slice_max(order_by=k2p_dist, with_ties = TRUE) 
 
 dir.create("diagnostic_alignments/amplicons")
 
 # VirutalPCR
-fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
+fs::dir_ls(path="diagnostic_alignments/cleaned", glob = "*.fa.gz") %>%
   purrr::map(function(x){
     print(x)
     loci_name <- basename(as.character(x)) %>% 
-    str_remove("_aligned.fa")
+    str_remove("\\..*$")
     
     seqs <- readDNAStringSet(x)
     
+    # Get best windows
     win_dat <- best_windows %>%
       filter(source == loci_name)
+
+    # Get binding position of primers
+    model <- readRDS(fs::dir_ls(path="diagnostic_alignments/model", glob = paste0("*",loci_name,"*")))
+    primers <- read_csv("primer_candidates.csv") %>%
+      dplyr::filter(loci == loci_name) %>%
+      seqateurs::coalesce_join(.$Fseq %>% purrr::map(get_binding_position, model, tryrc = FALSE, min_score=8) %>%
+              bind_rows() %>%
+              dplyr::rename(Fseq = primer, Fstart = start, Fend = end, Fscore = score ),
+              by="Fseq") %>%
+       seqateurs::coalesce_join(
+         .$Rseq %>% purrr::map(get_binding_position, model, tryrc = TRUE, min_score=8) %>%
+         bind_rows() %>%
+         dplyr::rename(Rseq = primer, Rstart = start, Rend = end, Rscore = score ),
+         by="Rseq")%>%
+       distinct()
     
-    for (p in 1:length(win_dat$win_length)){
-      amplicon <- Biostrings::subseq(seqs, start=win_dat$pos[p] + 1, end = win_dat$pos[p] + win_dat$win_length[p]) #may need to add 1 to start
+    # Amplicons
+    amplicons <- win_dat %>%
+      mutate(start = pos+1, 
+             end = pos + win_length,
+             win_length = as.character(win_length)) %>%
+      dplyr::select(source, win_length, start, end) %>%
+      bind_rows(primers %>% 
+                mutate(start = Fend,
+                       end = Rstart,
+                       win_length = paste0(Fname,"-", Rname))%>%
+                dplyr::select(source = loci,win_length, start, end))
+    
+    for (p in 1:nrow(amplicons)){
+      amplicon <- Biostrings::subseq(seqs, start=amplicons$start[p], end = amplicons$end[p]) #may need to add 1 to start
     
         #maxgaps <- 9 # dont allow any more than 9 gaps
         #rem <- names(amplicon)[Biostrings::letterFrequency(amplicon, "-") > maxgaps]
         #amplicon <- amplicon[!names(amplicon) %in% rem]
-        out_name <- paste0(win_dat$source[p],"_", win_dat$win_length[p],"bp")
+        out_name <- paste0(amplicons$source[p],"_", amplicons$win_length[p])
         #message(paste0(length(rem), " Sequences with more than ", maxgaps, 
         #               " gaps removed from ",out_name))
         Biostrings::writeXStringSet(amplicon, file=paste0("diagnostic_alignments/amplicons/", out_name,".fa.gz"), compress=TRUE)
@@ -682,95 +709,153 @@ Find mix of loci that covers the most amount of species
 - Combine all unique spp names covered across all alignments
 - Run ID success on full locus
 
+‘A taxon unambiguously identified by a primer pair owns a barcode sequence associated to
+this pair that is not shared by any other taxa’.
+
 ```{r id results}
+# Read in target list
+target_list <- readxl::read_xlsx("sample_data/Metabarcoding target list.xlsx") %>%
+  janitor::clean_names() %>%
+  mutate(genus = genus %>% str_remove(" .*$")) %>%
+  mutate(species = paste0(genus, " ", species))
+
 # copy the full length aligned sequences over
-fs::dir_ls(path="diagnostic_alignments/aligned/", glob = "*.fa*") %>%
+fs::dir_ls(path="diagnostic_alignments/cleaned/", glob = "*.fa.gz") %>%
   purrr::map(function(x){
-    file.copy(x, paste0("diagnostic_alignments/amplicons/", str_replace(basename(as.character(x)), "aligned", "full")), overwrite = TRUE)
+    file.copy(x, paste0("diagnostic_alignments/amplicons/", str_replace(basename(as.character(x)), ".fa", "_full.fa")), overwrite = TRUE)
   })
 
+# Filter these sequences 
+to_remove <- readLines("diagnostic_alignments/mislabelled.txt")
+
 # Get ID success with all
+x <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*") [[1]]
+
+
+#id_success <- id_success[str_detect(id_success, "_full")]
+
 id_success <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*") %>%
   purrr::map(function(x){
   print(x)
-  seqs <- insect::readFASTA(x)
-  
-  loci_name <- basename(as.character(x)) %>% 
-    str_remove("_aligned.fa") #%>% 
-   # str_remove("_.*$")
-  
-  # species names
-  spp_names <- names(seqs) %>%
-    str_remove("_*(?!.*_).*$") 
-  
-  # Make full distance matrix
-  dat <- as.matrix(seqs)
-  dimnames(dat)[[1]] <- spp_names
-  datd <- dist.dna(dat, pairwise.deletion = TRUE)
+  input_seqs <- readDNAStringSet(x)
 
-  # Create NJ tree from entire distance matrix
-  dat_tr <- bionjs(datd)
+  # Filter misannotated
+  input_seqs <- input_seqs[!names(input_seqs) %in% to_remove]
   
-  # Fix any negative edge lengths
-  dat_tr <- fix_negative_edge_length(dat_tr, collapse_multi = TRUE)
+  loci_name <- basename(as.character(x)) %>% str_remove(".fa.gz")
+
+  dataset <- c("all", "dacine", "target")
+  res <- vector("list", length=length(dataset))
+  for (d in 1:length(dataset)){
+    seqs <- input_seqs
+    
+    # Subset to relevant taxa dataset
+    if(dataset[d] == "dacine"){
+      seqs <- seqs[str_detect(names(seqs) %>% 
+                                str_remove("^.*;") %>%
+                                str_remove(" .*$"), "Bactrocera|Dacus|Zeugodacus|Monacrostichus")]
+    }else if (dataset[d] == "target"){
+      seqs <- seqs[(names(seqs) %>% str_remove("^.*;")) %in% target_list$species]
+    }
+    
+    seq_names <- names(seqs)
+    spp_names <- names(seqs) %>%
+        str_remove("^.*;")
+    names(seqs) <- spp_names
+   
+    # Make full distance matrix
+    datd <- DECIPHER::DistanceMatrix(seqs, includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
+                                     penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor", processors = 1, verbose = TRUE)
   
-  # Identification success with full tree 
-  full_mono <- tibble(spp = unique(spp_names), 
-               mono = monophyly(dat_tr, spp_names))
-  full_nn <- tibble(seqs = names(seqs),
-               spp = spp_names, 
-               nn = nearNeighbour(datd, spp_names))
-  
-  out <- full_nn %>%
-    left_join(full_mono, by="spp") %>%
-    mutate(loci = loci_name) %>%
-    dplyr::select(loci, spp, seqs, mono, nn) %>% 
-    group_by(loci) %>% 
-    nest() %>% 
-    mutate(tree = list(dat_tr))
-  
-  # Create plot of full tree
-  p1 <- ggtree(dat_tr)
-  
-  tree_labels <- p1$data %>% 
-    left_join(full_mono %>% dplyr::rename(label = spp), by="label")
-  
-  p2 <- p1 %<+% tree_labels + 
-    geom_tippoint(aes(colour=mono)) +
-    geom_tiplab()+
-    theme(legend.position = "top")+
-    labs(colour = "Monophyletic") +
-    scale_colour_manual(values=c("#e41a1c","#4daf4a"))
-  
-  # Save figure
-  out.dir <-"output/trees/"
-  if(!dir.exists(out.dir)){ dir.create(out.dir)}
-  
-  #Might be worth changing output height depending on number of seqs
-  plot_height <- round(length(spp_names) / 7)
-  pdf(file= paste0("output/trees/",loci_name, "_full.pdf"), width = 8, height = plot_height)
-    plot(p2)
-  try(dev.off(), silent=TRUE)
+    # Create NJ tree from entire distance matrix
+    dat_tr <- bionjs(datd) # try njs, bionjs, nj, and bionj and see how it changes things
+    
+    # Fix any negative edge lengths
+    dat_tr <- fix_negative_edge_length(dat_tr, collapse_multi = TRUE)
+    
+    # Identification success with full tree 
+    full_mono <- tibble(spp = unique(spp_names), 
+                 mono = monophyly(dat_tr, spp_names))
+    full_nn <- tibble(seqs = names(seqs),
+                 spp = spp_names, 
+                 nn = nearNeighbour(datd, spp_names))
+    
+    #full_diag <- tibble(spp = unique(spp_names), 
+    #             diag = as.numeric(nucDiag(datd, spp_names)))
+    
+    full_bcm <- tibble(seqs = names(seqs),
+                 bcm = bestCloseMatch(datd, spp_names, threshold=0.03))
+    
+    # Need to add a completely unique ID success criteria
+    
+    res[[d]] <- full_nn %>%
+      left_join(full_bcm, by="seqs") %>%
+      left_join(full_mono, by="spp") %>%
+      mutate(loci = loci_name, dataset = dataset[d]) %>%
+      dplyr::select(loci, dataset, spp, seqs, mono, nn, bcm) %>% 
+      group_by(loci, dataset) %>% 
+      nest() %>% 
+      mutate(tree = list(dat_tr))
+    
+    # Create plot of full tree
+    dat_tr$tip.label <- seq_names
+    p1 <- ggtree(dat_tr)
+    
+    tree_labels <- p1$data %>% 
+      mutate(spp = label %>% str_remove("^.*;")) %>%
+      left_join(full_mono, by="spp")
+    
+    p2 <- p1 %<+% tree_labels + 
+      geom_tippoint(aes(colour=mono)) +
+      geom_tiplab()+
+      theme(legend.position = "top")+
+      labs(colour = "Monophyletic") +
+      scale_colour_manual(values=c("#e41a1c","#4daf4a")) + 
+      scale_x_continuous(expand=c(-0.8, 0.4))
+    
+    # Save figure
+    out.dir <-"output/trees/"
+    if(!dir.exists(out.dir)){ dir.create(out.dir)}
+    
+    #Might be worth changing output height depending on number of seqs
+    plot_height <- round(length(spp_names) / 7)
+    pdf(file= paste0(out.dir,loci_name,"_",dataset[d], ".pdf"), width = 20, height = plot_height)
+      plot(p2)
+    try(dev.off(), silent=TRUE)
+      
+    # Write out newick
+    out.dir <-"output/trees/newick/"
+    if(!dir.exists(out.dir)){ dir.create(out.dir)}
+    write.tree(dat_tr, paste0(out.dir,loci_name,"_",dataset[d], ".nwk") )
+  }
+  out <- res %>%
+    dplyr::bind_rows()
   
   return(out)
 }) %>% 
   bind_rows()
 
-# make supertree to arrange plot around - This shoudl be done with fulllength not subset!
+# make supertree to arrange plot around only using hte full matrices
 tree_list <- id_success %>%
+  filter(str_detect(loci, "full"), dataset=="all") %>%
   pull(tree) 
 class(tree_list) <- "multiPhylo"
 supertree <- phangorn::superTree(tree_list)
 
 #saveRDS(supertree, "output/rds/supertree.rds")
-supertree <- readRDS("output/rds/supertree.rds")
+#supertree <- readRDS("output/rds/supertree.rds")
+
+# Test
+id_success %>%
+  dplyr::select(-tree) %>%
+  unnest(data)
 
 # Get all taxa combinations
 id_combinations <- id_success %>%
   dplyr::select(-tree) %>%
   unnest(data) %>%
-  group_by(loci, spp) %>%
-  dplyr::summarise(mono = paste(sort(unique(mono)), collapse = "/"), nn = paste(sort(unique(nn)), collapse = "/")) %>%
+  group_by(loci, spp, dataset) %>%
+  dplyr::summarise(mono = paste(sort(unique(mono)), collapse = "/"), nn = paste(sort(unique(nn)), collapse = "/"), bcm = paste(sort(unique(bcm)), collapse = "/")) %>%
   mutate(mono = case_when(
     mono == TRUE  ~ "correct",
     mono == FALSE ~ "incorrect",
@@ -780,40 +865,241 @@ id_combinations <- id_success %>%
     nn == TRUE  ~ "correct",
     nn == FALSE ~ "incorrect",
     str_detect(nn,"/") ~ "mixed"
+  ),
+  bcm = case_when(
+    bcm == "no id"  ~ "incorrect",
+    bcm == "ambiguous" ~ "mixed",
+    str_detect(bcm,"/") ~ "mixed",
+    TRUE ~ bcm
   )) %>%
   ungroup() %>%
-  tidyr::complete(loci, spp, fill=list(mono=NA, nn=NA))
+  tidyr::complete(loci, spp, fill=list(mono=NA, nn=NA, bcm=NA))%>%
+  mutate(genus = spp %>% str_remove(" .*$"))
+
+
+# Write out combinations
+id_combinations %>%
+  ungroup() %>%
+  dplyr::select(dataset, loci, spp, mono, nn, bcm) %>%
+  mutate(win_length = case_when(
+    str_detect(loci, "220") ~ "220bp",
+    str_detect(loci, "420") ~ "420bp",
+    str_detect(loci, "full") ~ "full",
+    TRUE ~ "primer"
+  )) %>%
+  filter(!is.na(dataset), win_length == "primer") %>%
+  dplyr::select(-win_length) %>%
+  pivot_longer(cols = c("mono", "nn", "bcm"), 
+               names_to = "metric",
+               values_to = "value") %>%
+  group_by(metric, dataset) %>%
+  mutate(value = case_when(
+    value == "correct" ~ TRUE,
+    value == "incorrect" ~ FALSE,
+    TRUE ~ NA
+  )) %>%
+  group_split() %>%
+  purrr::map(function(x){
+    metric <- unique(x$metric)
+    dataset <- unique(x$dataset)
+    x %>%
+      dplyr::select(-metric) %>%
+      pivot_wider(names_from = "loci",
+                  values_from = "value") %>%
+      write_csv(paste0("output/",metric,"_", dataset, "_id.csv"))
+    
+  })
+  
+# Get all possible combinations of 2 loci  
+find_all_combinations <- function(mat, n=2){
+  # Get all unique combinations up to N
+  comb_mat <- gtools::combinations(n = length(colnames(mat)), r = n, v = colnames(mat), repeats.allowed = FALSE)
+  res <- vector("list", length = nrow(comb_mat))
+  for (r in 1:nrow(comb_mat)){
+    cols_to_subset <- comb_mat[r,]
+    subset_mat <- mat[,cols_to_subset]
+    
+    # Get number of identified taxa
+    res[[r]] <- tibble(
+      comb = paste0(cols_to_subset, collapse="-"),
+      n_id = sum(rowSums(subset_mat) > 0),
+      failed=list(rownames(subset_mat)[(rowSums(subset_mat)== 0)])
+    )
+  }
+  out <- bind_rows(res) %>%
+    dplyr::mutate(n_total = nrow(mat))
+  return(out)
+}
+  
+all_combinations <- id_combinations %>%
+  #filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
+  #filter(genus == "Bactrocera") %>%
+  filter(spp %in% target_list$species) %>%
+  dplyr::select(-genus) %>%
+  mutate(primer = loci %>%
+           str_remove(".fa.gz")%>%
+           str_remove(".fa"),  
+         loci = loci %>% 
+           str_remove("_.*$")) %>%
+  mutate(win_length = case_when(
+    str_detect(primer, "220") ~ "220bp",
+    str_detect(primer, "420") ~ "420bp",
+    str_detect(primer, "full") ~ "full",
+    TRUE ~ "primer"
+  )) %>%
+  mutate(id = case_when(
+    mono == "correct" ~ 1,
+    mono == "incorrect" ~ 0,
+    mono == "mixed"  ~ 0,
+    TRUE ~ 0
+  )) %>%
+  dplyr::select(-nn, -mono, -bcm) %>%
+  distinct() %>%
+  ungroup()%>%
+  group_by(win_length, dataset) %>%
+  dplyr::select(-loci) %>%
+  group_modify(~{
+    id_matrix <- .x %>%
+      #dplyr::select(-win_length, -dataset) %>%
+      pivot_wider(names_from = primer,
+              values_from = id,
+              values_fill = 0) %>%
+      column_to_rownames("spp") %>%
+      as.matrix()
+    return(find_all_combinations(id_matrix, n=2))
+  })
+
+
+gg.all_bars <- all_combinations %>%
+  dplyr::select(-where(is.list)) %>%
+  group_by(win_length) %>%
+  mutate(prop_id =  n_id / n_total) %>%
+  ungroup() %>%
+  mutate(comb = comb %>% 
+           str_replace("EIF3L_EIF3L_", "EIF3L_")%>% 
+           str_replace("DDOST_DDOST2_", "DDOST2_")%>% 
+           str_replace("POP4_POP4_", "POP4_") %>% 
+           str_replace("RPA2_RPA2_", "RPA2_") ) %>%
+  mutate(comb = reorder_within(comb, -prop_id, within=win_length)) %>%
+  mutate(win_length = win_length %>%
+           factor(levels = c("full", "420bp", "220bp", "primer"))) %>%
+  filter(!is.na(dataset)) %>%
+  #mutate(n_loci = as.numeric(n_loci)) %>%
+  ggplot(aes(x = comb, y = prop_id, fill=win_length))+
+  geom_col() + 
+  geom_text(aes(label=scales::percent(prop_id, accuracy=0.1)), vjust = 0.5, size=4, angle=90, hjust=1.2, colour="grey20")+
+  facet_grid(dataset~win_length, space="free", scales="free_x", drop=TRUE) +
+  scale_x_reordered() +
+  base_theme + 
+  scale_y_continuous(labels= scales::percent_format(), limits=c(0,1))+
+  scale_fill_brewer(palette="Paired") +
+  labs(x = "Marker combination",
+       y = "Percentage identified")
+
+
+gg.all_bars
+
+pdf(file= "fig/2primer_id_combinations.pdf", width = 11, height = 8, paper="a4r")
+  plot(gg.all_bars)
+try(dev.off(), silent=TRUE)
+  
+# Check differences between COI-EIF3L and COI-EIF3L-DDOST
+
+setdiff(all_combinations %>%
+  ungroup() %>%
+  filter(dataset == "target", comb == "COI_fwhF2-fwhR2n-EIF3L_EIF3L_miniF4-EIF3L_miniR4") %>%
+  unnest(failed) %>%
+  pull(failed),
+  all_combinations %>%
+  ungroup() %>%
+  filter(dataset == "target", comb == "COI_fwhF2-fwhR2n-DDOST_DDOST2_miniF1-DDOST2_miniR1") %>%
+  unnest(failed) %>%
+  pull(failed))
+  
+  
+coi_id <- id_combinations %>% 
+  filter(dataset == "target", loci == "COI_fwhF2-fwhR2n", mono=="correct") 
+
+ddost_id <- id_combinations %>% 
+  filter(!spp %in% coi_id$spp) %>% # Remove those already id'd by COI
+  filter(dataset == "target", loci == "DDOST_DDOST2_miniF1-DDOST2_miniR1") %>%
+  select(dataset, spp, ddost_id = nn) %>%
+  left_join(
+    id_combinations %>% 
+    filter(dataset == "target", loci == "EIF3L_EIF3L_miniF1-EIF3L_miniR1") %>%
+    select(dataset, spp, eifel_id = nn)
+  )
+
 
 # plot tree
 p1 <- ggtree(supertree, ladderize = TRUE,branch.length = "none") 
   
 # Plot heatmap and arrange by tree
-gg.id_comb <- id_combinations %>%
+library(tidytext)
+
+plot_id_combinations <- id_combinations %>%
   left_join(p1$data %>% dplyr::rename(spp = label)) %>%
-  filter(!str_detect(loci,"320bp")) %>%
-  mutate(primer = loci %>% 
-           str_remove("^.*_") %>%
+  mutate(primer = loci %>%
            str_remove(".fa.gz")%>%
-           str_remove(".fa") %>%
-           factor(levels = c("full", "420bp", "220bp")), #"320bp", 
+           str_remove(".fa"),  
          loci = loci %>% 
            str_remove("_.*$")) %>%
-  mutate(loci = factor(loci, levels =c("COI", "EIF3L", "DDOST", "RPA2", "POP4"))) %>%
+  group_by(loci, primer) %>%
+  mutate(perc_id = sum(nn=="correct",na.rm = TRUE) / sum(!is.na(nn))) %>%
+  #mutate(perc_id = sum(mono=="correct",na.rm = TRUE) / sum(!is.na(mono))) %>%
+  ungroup() %>%
+  mutate(primer = reorder_within(primer,by= -perc_id, within=loci, fun=mean)) %>%
+  mutate(loci = factor(loci, levels =c("COI", "EIF3L", "DDOST", "RPA2", "POP4"))) 
+
+gg.id_comb <- plot_id_combinations %>%
   ggplot(aes(x = primer, y = fct_reorder(spp, y), fill=mono)) +
   geom_tile() +
   facet_grid(~loci, scales="free_x", space="free", drop=TRUE) +
+  scale_x_reordered()+
   scale_fill_manual(values = c(correct="#66bd63", incorrect="#d73027", mixed = "#ffffbf")) + 
   base_theme +
   labs(x = "Primer set",
-       y = NULL
-       )
+       y = NULL)
  
-gg.id_multifig <- p1 + gg.id_comb + plot_layout(widths = c(1,3))
+gg.id_multifig_all <- p1 + gg.id_comb + plot_layout(widths = c(1,3))
 
-gg.id_multifig
+gg.id_multifig_all
 
-pdf(file= "fig/id_combination.pdf", width = 8, height = 16)
-  plot(gg.id_multifig)
+gg.id_dacine <- plot_id_combinations %>%
+  filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
+  ggplot(aes(x = primer, y = fct_reorder(spp, y), fill=mono)) +
+  geom_tile() +
+  facet_grid(~loci, scales="free_x", space="free", drop=TRUE) +
+  scale_x_reordered()+
+  scale_fill_manual(values = c(correct="#66bd63", incorrect="#d73027", mixed = "#ffffbf")) + 
+  base_theme +
+  labs(x = "Primer set",
+       y = NULL)
+
+gg.id_dacine
+
+gg.id_target <- plot_id_combinations %>%
+  filter(spp %in% target_list$species) %>%
+  ggplot(aes(x = primer, y = fct_reorder(spp, y), fill=mono)) +
+  geom_tile() +
+  facet_grid(~loci, scales="free_x", space="free", drop=TRUE) +
+  scale_x_reordered()+
+  scale_fill_manual(values = c(correct="#66bd63", incorrect="#d73027", mixed = "#ffffbf")) + 
+  base_theme +
+  labs(x = "Primer set",
+       y = NULL)
+
+gg.id_target
+
+# Facet by genus?
+# Do one for just dacinae
+
+pdf(file= "fig/id_combination_all.pdf", width = 8, height = 50)
+  plot(gg.id_multifig_all)
+try(dev.off(), silent=TRUE)
+  
+pdf(file= "fig/id_combination_dacine.pdf", width = 8, height = 30)
+  plot(gg.id_dacine)
 try(dev.off(), silent=TRUE)
   
 # I want to find a best combination of 2 columns that maximizes the number on non-0 values per row
@@ -835,30 +1121,39 @@ find_top_combinations <- function(mat, n=2){
 
 #Find best 2 combinations of loci - Do this for each length category
 best_combinations <- id_combinations %>%
-  mutate(win_length = loci %>% 
-           str_remove("^.*_") %>%
+  filter(spp %in% target_list$species) %>%
+  #filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
+  dplyr::select(-genus) %>%
+  mutate(primer = loci %>%
            str_remove(".fa.gz")%>%
-           str_remove(".fa"),
-         loci = loci   %>% 
-           str_remove("_.*$")%>%
-           str_remove(".fa.gz")%>%
-           str_remove(".fa")) %>%
-  dplyr::select(-nn) %>%
-  mutate(mono = case_when(
+           str_remove(".fa"),  
+         loci = loci %>% 
+           str_remove("_.*$")) %>%
+  mutate(win_length = case_when(
+    str_detect(primer, "220") ~ "220bp",
+    str_detect(primer, "420") ~ "420bp",
+    str_detect(primer, "full") ~ "full",
+    TRUE ~ "primer"
+  )) %>%
+  mutate(id = case_when(
     mono == "correct" ~ 1,
     mono == "incorrect" ~ 0,
+    mono == "mixed"  ~ 0,
     TRUE ~ 0
   )) %>%
+  dplyr::select(-nn, -mono, -bcm) %>%
   distinct() %>%
-  group_by(win_length) %>%
+  ungroup()%>%
+  group_by(win_length, dataset) %>%
+  dplyr::select(-loci) %>%
   group_modify(~{
     id_matrix <- .x %>%
-      pivot_wider(names_from = loci,
-              values_from = mono,
-              values_fill = 0)%>%
+      pivot_wider(names_from = primer,
+              values_from = id,
+              values_fill = 0) %>%
       column_to_rownames("spp") %>%
       as.matrix()
-    
+
     # 1 loci
     subset_matrix_1 <- id_matrix[,find_top_combinations(id_matrix, n=1)]
     n_id_1 <- length(unique(names(subset_matrix_1)[subset_matrix_1 == 1]))
@@ -883,17 +1178,17 @@ best_combinations <- id_combinations %>%
 
 # Look at gain in accuracy as you add more loci - Do this for each length category
 gg.id_bars <- best_combinations %>%
-  group_by(win_length, n_loci) %>%
+  group_by(win_length, n_loci, dataset) %>%
   mutate(prop_id =  n_id / n_total) %>%
   ungroup() %>%
-  filter(!win_length == "320bp") %>%
-  mutate(win_length = win_length %>%
-           factor(levels = c("full", "420bp", "220bp"))) %>% #"320bp",
+  filter(!is.na(dataset)) %>%
+#  mutate(win_length = win_length %>%
+#           factor(levels = c("full", "420bp", "220bp"))) %>% #"320bp",
   mutate(n_loci = as.numeric(n_loci)) %>%
   ggplot(aes(x = fct_reorder(comb, n_loci), y = prop_id, fill = as.factor(n_loci)))+
   geom_col() + 
   geom_text(aes(label=n_id), vjust = -0.5)+
-  facet_grid(~win_length, space="free", scales="free_x", drop=TRUE) +
+  facet_grid(dataset~win_length, space="free", scales="free_x", drop=TRUE) +
   base_theme + 
   scale_y_continuous(labels= scales::percent_format())+
   scale_fill_brewer(palette="Paired") +
@@ -902,10 +1197,11 @@ gg.id_bars <- best_combinations %>%
 
 gg.id_bars
 
-pdf(file= "fig/id_combination_bars.pdf", width = 11, height = 8, paper="a4r")
+pdf(file= "fig/id_combination_bars.pdf", width = 11, height = 15)
   plot(gg.id_bars)
 try(dev.off(), silent=TRUE)
   
+# Find the differences
 
 # look at what species are gained when you add another by each
 
@@ -946,32 +1242,144 @@ comp2 <- failed_id_combinations %>%
 setdiff(comp1, comp2)
 ```
 
+# Predicted mismatch
+
+```{r Primerminer, message=FALSE}
+# Get ID success with all
+mismatch <- fs::dir_ls(path="diagnostic_alignments/cleaned/", glob = "*.fa*") %>%
+  purrr::map(function(x){
+    print(x)
+    loci_name <- basename(as.character(x)) %>% 
+    str_remove("\\..*$")
+    
+    seqs <- insect::readFASTA(x)
+    
+    # Get binding position of primers
+    model <- readRDS(fs::dir_ls(path="diagnostic_alignments/model", glob = paste0("*",loci_name,"*")))
+    primers <- read_csv("primer_candidates.csv")%>%
+      dplyr::filter(loci == loci_name)%>% 
+      select(loci, name = Fname, primer=Fseq) %>%
+      left_join(.$primer %>% purrr::map(get_binding_position, model, tryrc = FALSE, min_score=8) %>%
+              bind_rows()) %>%
+      mutate(dir="F") %>%
+      bind_rows( read_csv("primer_candidates.csv")%>%
+      dplyr::filter(loci == loci_name)%>% 
+      select(loci, name = Rname, primer=Rseq) %>%
+      left_join(.$primer %>% purrr::map(get_binding_position, model, tryrc = TRUE, min_score=8) %>%
+              bind_rows()) %>%
+      mutate(dir="R")
+      ) 
+    
+    mismatch <- vector("list", length=nrow(primers))
+    for (p in 1:nrow(primers)){
+      mismatch[[p]] <- evaluate_primer(seqs, primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
+                                  direction = ifelse(primers$dir[p] == "F", "F", "R"), count_gaps = FALSE, count_N = FALSE,
+                                  adjacent = 2) %>%
+        mutate(primer = primers$name[p], primer_seq = primers$primer[p])
+    }
+    
+    out <- mismatch %>%
+      bind_rows() %>%
+      mutate(loci = loci_name)
+    return(out)    
+  })%>%
+  bind_rows()
+
+# all
+mismatch %>%
+  mutate(genus = template %>% str_remove("^.*;") %>%
+           str_remove(" .*$")) %>%
+  group_by(genus, loci, primer, direction) %>%
+  summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
+  ungroup() %>%
+  filter(!is.na(mismatch)) %>%
+  ggplot(aes(x = primer, y = genus, fill=mismatch)) +
+  geom_tile() +
+  facet_grid(~direction, drop = TRUE, scales="free_x") +
+  base_theme
+
+# Dacinae
+mismatch %>%
+  mutate(genus = template %>% str_remove("^.*;") %>%
+           str_remove(" .*$"),
+         species = template %>% str_remove("^.*;")) %>%
+  group_by(species,genus, loci, primer, direction) %>%
+  summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
+  ungroup() %>%
+  filter(!is.na(mismatch)) %>%
+  filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
+  ggplot(aes(x = primer, y = species, fill=mismatch)) +
+  geom_tile() +
+  facet_grid(~direction, drop = TRUE, scales="free_x") +
+  base_theme
+
+#targets
+# Read in target list
+target_list <- readxl::read_xlsx("sample_data/Metabarcoding target list.xlsx") %>%
+  janitor::clean_names() %>%
+  mutate(genus = genus %>% str_remove(" .*$")) %>%
+  mutate(species = paste0(genus, " ", species))
+
+# Targets heatmap
+mismatch %>%
+  mutate(genus = template %>% str_remove("^.*;") %>%
+           str_remove(" .*$"),
+         species = template %>% str_remove("^.*;")) %>%
+  group_by(species,genus, loci, primer, direction) %>%
+  summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
+  ungroup() %>%
+  group_by(loci, primer, direction) %>%
+  mutate(mean_mm = mean(mismatch, na.rm=TRUE)) %>%
+  ungroup() %>%
+  mutate(primer = reorder_within(primer, mean_mm, direction)) %>%
+  filter(!is.na(mismatch)) %>%
+  filter(species %in% target_list$species) %>%
+  ggplot(aes(x = primer, y = species, fill=mismatch)) +
+  geom_tile() +
+  facet_grid(~direction, drop = TRUE, scales="free_x") +
+  scale_x_reordered()+
+  scale_fill_viridis_c(trans=scales::pseudo_log_trans(10), option = "B", limits=c(0,1000), oob=scales::squish)+
+  base_theme +
+  theme(legend.position = "right") +
+  labs(x = "Primer",
+       y = "Target species",
+       fill = "Mismatch \npenalty")
 
 
- Primer design 
 
-Rules:
-2 GC bases
-Think about the length of your primers (20-25 bp is usually ideal) and the region you’re copying
-Aim for a GC content of 40-60 %
-Pay particular attention to the 3′ end, especially with Gs and Cs
-Avoid repeats of one or two bases more than four times
-Ideally keep the melting temperature around the 60 °C mark
-Try to keep the melting temperatures within 5 °C between the forward and reverse
-Check for self-dimerisation or dimerisation between the forward and reverse
-Consider degenerate bases (but not too many)
+gg.radar_f <- mismatch %>%
+  mutate(genus = template %>% str_remove("^.*;") %>%
+           str_remove(" .*$"),
+         species = template %>% str_remove("^.*;")) %>%
+  filter(direction == "F") %>%
+  filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
+  group_by(genus, primer) %>%
+  summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = genus,
+              values_from = mismatch,
+              values_fill=list(mismatch=0))%>%
+  mutate_at(vars(-primer), function(x) {1-scales::rescale(x)}) %>%
+  ggradar() 
 
- 
- Identification success for each primer set
+gg.radar_r <- mismatch %>%
+  mutate(genus = template %>% str_remove("^.*;") %>%
+           str_remove(" .*$"),
+         species = template %>% str_remove("^.*;")) %>%
+  filter(direction == "R") %>%
+  filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
+  group_by(genus, primer) %>%
+  summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = genus,
+              values_from = mismatch,
+              values_fill=list(mismatch=0))%>%
+  mutate_at(vars(-primer), function(x) {1-scales::rescale(x)}) %>%
+  ggradar() +
+  scale_color_brewer(palette="Set1")
 
-- Chop the alignment to the region amplified
-- Calculate the differentiation at a giver percentage ID
-- Make a tree + heatmap for each indivuald primer, colour by whether its correctly identified or not
-
- Identification success for multiple loci
-
-- Calculate all possible cobinations of loci
-- Create a tree + heatmap for whether each combination can correctly identify each taxa
+gg.radar_f / gg.radar_r
+```
 
 
 # Sequence logos
@@ -979,7 +1387,7 @@ Consider degenerate bases (but not too many)
 ```{r Create sequence logos}
 library(ggseqlogo)
 
-seq_logos <- fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
+seq_logos <- fs::dir_ls(path="diagnostic_alignments/cleaned", glob = "*.fa") %>%
   purrr::map(function(x){
     seqs <- dna2char(insect::readFASTA(x))
     ggplot() + 
@@ -1002,50 +1410,6 @@ try(dev.off(), silent=TRUE)
 ```
 
 
-
-# Predicted mismatch
-
-```{r Primerminer, message=FALSE}
-library(PrimerMiner)
-## Target sequences to test against
-seqs <- insect::readFASTA("reference/merged_final.fa.gz")
-names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
-writeFASTA(seqs, "primer_evaluation/merged_final_target.fa")
-
-target <- "primer_evaluation/merged_final_target.fa"
-
-# Load primers
-primers <- read_csv("primer_evaluation/primer_candidates.csv") %>%
-  mutate(seq = str_replace_all(seq, "I","N")) %>% 
-  select(-score, -issues)
-
-dir.create("primer_evaluation/PrimerMiner")
-
-for (i in 1:nrow(primers)) {
-  if(primers$strand[i]=="F"){
-  evaluate_primer(target,
-   as.character(primers$seq[i]), primers$start[i], primers$end[i],
-   forward = TRUE, gap_NA = TRUE, N_NA=TRUE,
-   mm_position = "Position_v1", mm_type = "Type_v1", adjacent = 2,
-   save = paste0("primer_evaluation/PrimerMiner/", primers$name[i],".csv")
-  )
-  } else if(primers$strand[i]=="R"){
-  evaluate_primer(target,
-   as.character(primers$seq[i]), primers$start[i], primers$end[i],
-   forward = FALSE, gap_NA = TRUE, N_NA=TRUE,
-   mm_position = "Position_v1", mm_type = "Type_v1", adjacent = 2,
-   save = paste0("primer_evaluation/PrimerMiner/", primers$name[i],".csv")
-  )
- }
-}
-
-# gZip files
-fs::dir_ls(path="primer_evaluation/PrimerMiner", glob = "*.csv") %>%
-  purrr::map(R.utils::gzip)
-
-```
-
-
 ## SW gifs
 
 ```{r sw gif}
@@ -1056,7 +1420,7 @@ dir.create("gifs")
 win_length <- 220
 win_int <- 20
 
-fs::dir_ls(path="diagnostic_alignments/aligned", glob = "*.fa") %>%
+fs::dir_ls(path="diagnostic_alignments/cleaned", glob = "*.fa") %>%
   purrr::map(function(x){
   print(x)
   seqs <- insect::readFASTA(x)
