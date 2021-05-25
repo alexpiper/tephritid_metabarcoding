@@ -554,58 +554,6 @@ saveRDS(sw_merged, "output/rds/sw_merged.rds")
 sw_merged <- readRDS("output/rds/sw_merged.rds")
 # Could maybe put them all on the same grid?
 
-# All on one plot
-sw_merged %>%
-  filter(is.finite(k2p_dist)) %>%
-  pivot_longer(c("diag", "k2p_dist", "mono_comp"),
-               names_to="metric",
-               values_to="value") %>%
-  group_by(metric) %>%
-  mutate(prop = value / sum(value) * 100) %>%
-  mutate(z_norm = znorm(value)) %>%
-  ungroup()%>%
-  ggplot(aes(x = pos, y = z_norm, colour=metric, group=metric))+
-  geom_line() + 
-  theme_bw()+
-  facet_grid(source~win_length, scales="free", space="free")+
-      scale_x_continuous(expand=c(0,0), breaks = seq(0, max(sw_merged$pos), 20))+
-      scale_y_continuous(expand=c(0,0)) +
-  theme(panel.grid = element_blank())
-  
-# Just tree monophyly comparison
-sw_merged %>%
-  filter(is.finite(k2p_dist)) %>%
-  pivot_longer(c("mono_comp", "nn_comp"),
-               names_to="metric",
-               values_to="value") %>%
-  #group_by(metric) %>%
- # mutate(prop = value / sum(value) * 100) %>%
-  #mutate(z_norm = znorm(value)) %>%
-  ungroup()%>%
-  ggplot(aes(x = pos, y = value, colour=metric))+
-  geom_line() + 
-  theme_bw()+
-  facet_grid(source~win_length)+
-      scale_x_continuous(expand=c(0,0), breaks = seq(0, max(sw_merged$pos), 20))+
-      scale_y_continuous(expand=c(0,0), limits=c(0,1), labels = scales::percent_format()) +
-  theme(panel.grid = element_blank())
-
-# Just nearest neighbour comparison
-sw_merged %>%
-  filter(is.finite(k2p_dist)) %>%
-  pivot_longer(c("nn_comp", "nn_all"),
-               names_to="metric",
-               values_to="value") %>%
-  ungroup()%>%
-  ggplot(aes(x = pos, y = value, colour=metric))+
-  geom_line() + 
-  theme_bw()+
-  facet_grid(source~win_length)+
-      scale_x_continuous(expand=c(0,0), breaks = seq(0, max(sw_merged$pos), 20))+
-      scale_y_continuous(expand=c(0,0), limits=c(0,1), labels = scales::percent_format()) +
-  theme(panel.grid = element_blank())
-
-# Mono comp different lengths
 # Just tree monophyly comparison
 gg.mono_comparison <- sw_merged %>%
   filter(is.finite(k2p_dist), !win_length == "320") %>%
@@ -714,10 +662,27 @@ this pair that is not shared by any other taxa’.
 
 ```{r id results}
 # Read in target list
-target_list <- readxl::read_xlsx("sample_data/Metabarcoding target list.xlsx") %>%
+#target_list <- readxl::read_xlsx("sample_data/Metabarcoding target list.xlsx") %>%
+#  janitor::clean_names() %>%
+#  mutate(genus = genus %>% str_remove(" .*$")) %>%
+#  mutate(species = paste0(genus, " ", species))
+
+
+target_list <- readxl::read_xlsx("sample_data/180613 _ALL FF_Lucid Key_NAQS flies.xlsx") %>%
   janitor::clean_names() %>%
+  dplyr::select(lure = trap_lure_type, genus, species) %>%
   mutate(genus = genus %>% str_remove(" .*$")) %>%
   mutate(species = paste0(genus, " ", species))
+
+# Cue lure 
+cue_list <- target_list %>%
+  filter(lure == "CUE") %>%
+  pull(species)
+
+# Cue lure 
+me_list <- target_list %>%
+  filter(lure == "ME") %>%
+  pull(species)  
 
 # copy the full length aligned sequences over
 fs::dir_ls(path="diagnostic_alignments/cleaned/", glob = "*.fa.gz") %>%
@@ -731,7 +696,6 @@ to_remove <- readLines("diagnostic_alignments/mislabelled.txt")
 # Get ID success with all
 x <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*") [[1]]
 
-
 #id_success <- id_success[str_detect(id_success, "_full")]
 
 id_success <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*") %>%
@@ -744,9 +708,10 @@ id_success <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*"
   
   loci_name <- basename(as.character(x)) %>% str_remove(".fa.gz")
 
-  dataset <- c("all", "dacine", "target")
+  dataset <- c("all","dacine", "target", "me", "cue") #
   res <- vector("list", length=length(dataset))
   for (d in 1:length(dataset)){
+    print(dataset[d])
     seqs <- input_seqs
     
     # Subset to relevant taxa dataset
@@ -756,6 +721,10 @@ id_success <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*"
                                 str_remove(" .*$"), "Bactrocera|Dacus|Zeugodacus|Monacrostichus")]
     }else if (dataset[d] == "target"){
       seqs <- seqs[(names(seqs) %>% str_remove("^.*;")) %in% target_list$species]
+    }else if (dataset[d] == "cue"){
+      seqs <- seqs[(names(seqs) %>% str_remove("^.*;")) %in% cue_list]
+    }else if (dataset[d] == "me"){
+      seqs <- seqs[(names(seqs) %>% str_remove("^.*;")) %in% me_list]
     }
     
     seq_names <- names(seqs)
@@ -776,18 +745,18 @@ id_success <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*"
     # Identification success with full tree 
     full_mono <- tibble(spp = unique(spp_names), 
                  mono = monophyly(dat_tr, spp_names))
-    full_nn <- tibble(seqs = names(seqs),
+    full_nn <- tibble(seqs = seq_names,
                  spp = spp_names, 
                  nn = nearNeighbour(datd, spp_names))
     
     #full_diag <- tibble(spp = unique(spp_names), 
     #             diag = as.numeric(nucDiag(datd, spp_names)))
     
-    full_bcm <- tibble(seqs = names(seqs),
+    full_bcm <- tibble(seqs = seq_names,
                  bcm = bestCloseMatch(datd, spp_names, threshold=0.03))
     
     # Need to add a completely unique ID success criteria
-    
+    dat_tr$tip.label <- seq_names
     res[[d]] <- full_nn %>%
       left_join(full_bcm, by="seqs") %>%
       left_join(full_mono, by="spp") %>%
@@ -798,7 +767,7 @@ id_success <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*"
       mutate(tree = list(dat_tr))
     
     # Create plot of full tree
-    dat_tr$tip.label <- seq_names
+
     p1 <- ggtree(dat_tr)
     
     tree_labels <- p1$data %>% 
@@ -834,6 +803,7 @@ id_success <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*"
   return(out)
 }) %>% 
   bind_rows()
+
 
 # make supertree to arrange plot around only using hte full matrices
 tree_list <- id_success %>%
@@ -872,7 +842,7 @@ id_combinations <- id_success %>%
     str_detect(bcm,"/") ~ "mixed",
     TRUE ~ bcm
   )) %>%
-  ungroup() %>%
+  ungroup() # %>%
   tidyr::complete(loci, spp, fill=list(mono=NA, nn=NA, bcm=NA))%>%
   mutate(genus = spp %>% str_remove(" .*$"))
 
@@ -894,9 +864,10 @@ id_combinations %>%
                values_to = "value") %>%
   group_by(metric, dataset) %>%
   mutate(value = case_when(
-    value == "correct" ~ TRUE,
-    value == "incorrect" ~ FALSE,
-    TRUE ~ NA
+    value == "correct" ~ "TRUE",
+    value == "incorrect" ~ "FALSE",
+    value == "mixed" ~ "MIXED",
+    TRUE ~ "NA"
   )) %>%
   group_split() %>%
   purrr::map(function(x){
@@ -934,7 +905,7 @@ find_all_combinations <- function(mat, n=2){
 all_combinations <- id_combinations %>%
   #filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
   #filter(genus == "Bactrocera") %>%
-  filter(spp %in% target_list$species) %>%
+  #filter(spp %in% target_list$species) %>%
   dplyr::select(-genus) %>%
   mutate(primer = loci %>%
            str_remove(".fa.gz")%>%
@@ -1273,8 +1244,8 @@ mismatch <- fs::dir_ls(path="diagnostic_alignments/cleaned/", glob = "*.fa*") %>
     mismatch <- vector("list", length=nrow(primers))
     for (p in 1:nrow(primers)){
       mismatch[[p]] <- evaluate_primer(seqs, primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
-                                  direction = ifelse(primers$dir[p] == "F", "F", "R"), count_gaps = FALSE, count_N = FALSE,
-                                  adjacent = 2) %>%
+                                  direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "skip", ambig = "skip",
+                                  adjacent = 2, quiet=FALSE) %>%
         mutate(primer = primers$name[p], primer_seq = primers$primer[p])
     }
     
@@ -1315,8 +1286,14 @@ mismatch %>%
 
 #targets
 # Read in target list
-target_list <- readxl::read_xlsx("sample_data/Metabarcoding target list.xlsx") %>%
+#target_list <- readxl::read_xlsx("sample_data/Metabarcoding target list.xlsx") %>%
+#  janitor::clean_names() %>%
+#  mutate(genus = genus %>% str_remove(" .*$")) %>%
+#  mutate(species = paste0(genus, " ", species))
+
+target_list <- readxl::read_xlsx("sample_data/180613 _ALL FF_Lucid Key_NAQS flies.xlsx") %>%
   janitor::clean_names() %>%
+  dplyr::select(lure = trap_lure_type, genus, species) %>%
   mutate(genus = genus %>% str_remove(" .*$")) %>%
   mutate(species = paste0(genus, " ", species))
 
@@ -1344,7 +1321,6 @@ mismatch %>%
   labs(x = "Primer",
        y = "Target species",
        fill = "Mismatch \npenalty")
-
 
 
 gg.radar_f <- mismatch %>%
@@ -1380,6 +1356,261 @@ gg.radar_r <- mismatch %>%
 
 gg.radar_f / gg.radar_r
 ```
+
+
+# Impute missing
+
+Compare imputign scores from tree, vs imputing sequences then calculating scores
+
+Steps:
+- get known outcomes by filtering to only complete sequences and calculating scores
+- Randomly Drop out the entire binding positions (or part of binding positions) for a subset of known sequences (10%?)
+- Impute sequence data then calculate scores OR calculate scores then impute scores
+- Compare RMSE between the known and imptued data
+
+
+```{r}
+
+seqs <- insect::readFASTA("diagnostic_alignments/cleaned/COI.fa.gz")
+
+# Make full distance matrix
+datd <- DECIPHER::DistanceMatrix(DNAbin2DNAstringset(seqs), includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
+                                 penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor", processors = 1, verbose = TRUE)
+
+tree <- bionjs(datd)
+
+# Get binding position of primers
+model <- readRDS("diagnostic_alignments/model/Bactrocera_COI.rds")
+
+primers <- read_csv("primer_candidates.csv")%>%
+  dplyr::filter(loci == loci_name)%>% 
+  select(loci, name = Fname, primer=Fseq) %>%
+  left_join(.$primer %>% purrr::map(get_binding_position, model, tryrc = FALSE, min_score=8) %>%
+          bind_rows()) %>%
+  mutate(dir="F") %>%
+  bind_rows( read_csv("primer_candidates.csv")%>%
+  dplyr::filter(loci == loci_name)%>% 
+  select(loci, name = Rname, primer=Rseq) %>%
+  left_join(.$primer %>% purrr::map(get_binding_position, model, tryrc = TRUE, min_score=8) %>%
+          bind_rows()) %>%
+  mutate(dir="R")
+  ) 
+    
+set.seed(666)
+mismatch_rmse <- vector("list", length=nrow(primers))
+for (p in 1:nrow(primers)){
+
+  # Calculate the mismatch for the full known seqs
+  known_mismatch <- evaluate_primer(seqs, primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
+                             direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "skip", ambig = "skip",
+                             adjacent = 2, quiet=FALSE) %>%
+   mutate(primer = primers$name[p], primer_seq = primers$primer[p])
+  
+  # Delete a random 10% within the binding regions
+  to_delete <- sample(seq(1, length(seqs),1), round(length(seqs)/5), replace = FALSE)
+  eval_seqs <- as.matrix(seqs)
+  eval_seqs[to_delete, primers$start[p]:primers$end[p]] <- as.raw(00)
+  
+  # Calculate the mismatch for the full known seqs
+  imputed_mismatch <- evaluate_primer(as.list(eval_seqs), primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
+                             direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "impute", ambig = "impute",
+                             adjacent = 2, quiet=FALSE, tree=tree) %>%
+   mutate(primer = primers$name[p], primer_seq = primers$primer[p]) 
+  
+  # Calculate RMSE for just the imputed ones
+  eval_mismatch <- known_mismatch[to_delete,] %>%
+    dplyr::select(template_name, known_seq = template_seq, known_mm = sum, primer) %>%
+    left_join(imputed_mismatch[to_delete,]%>%
+    dplyr::select(template_name, imputed_seq = template_seq, impute_mm = sum, primer)) 
+  
+  eval_rmse1 <- eval_mismatch %>%
+    rmse(truth = known_mm, estimate=impute_mm) %>%
+    dplyr::select(rmse1 = .estimate)
+  
+  
+  # Alternatively - Impute the mismatch scores rather than the sequence
+  unimputed_mismatch <- evaluate_primer(as.list(eval_seqs), primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
+                             direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "skip", ambig = "skip",
+                             adjacent = 2, quiet=FALSE, tree=tree) %>%
+   mutate(primer = primers$name[p], primer_seq = primers$primer[p]) 
+  
+  # Impute mismatch score 
+  
+  #Get subtree of only genera
+  pruned_tree  <- castor::get_subtree_with_tips(tree,
+                                            only_tips = names(eval_seqs),
+                                            collapse_monofurcations=TRUE,
+                                            force_keep_root=TRUE)$subtree
+  
+  Ntips 	<- length(pruned_tree$tip.label)
+  Nnodes 	<- pruned_tree$Nnode
+
+  # create internal node labels
+  pruned_tree$node.label <- NA
+  if(is.na(pruned_tree$node.label)){
+  	pruned_tree$node.label = paste("node.", 1:Nnodes, sep = "") # don't use underscores, because some tree readers (e.g. rncl) interpret them as spaces
+  }
+  # replace zero-length edges
+  if(any(pruned_tree$edge.length==0)){
+    epsilon = 0.1*min(pruned_tree$edge.length[pruned_tree$edge.length>0])
+  	pruned_tree$edge.length[pruned_tree$edge.length==0] = epsilon
+  }
+    
+  tip_states <- unimputed_mismatch %>%
+    column_to_rownames("template_name") %>%
+    dplyr::select(values  = sum)
+    
+  row2tip <- match(rownames(tip_states), pruned_tree$tip.label)
+  
+  tip_states <- tip_states[!is.na(row2tip),,drop = FALSE]
+  hsp_states <- castor::hsp_independent_contrasts(tree = pruned_tree,
+                                              tip_states = tip_states$values,
+                                              weighted = FALSE,
+                                              check_input = TRUE)$states
+  imputed_states <- tip_states %>%
+    mutate(impute_mm = hsp_states[1:Ntips])
+  
+  eval_mismatch2 <- known_mismatch[to_delete,] %>%
+    dplyr::select(template_name, known_seq = template_seq, known_mm = sum, primer) %>%
+    left_join(imputed_states[to_delete,]%>%
+                rownames_to_column("template_name") %>%
+    dplyr::select(template_name,impute_mm)) 
+  
+  eval_rmse2 <- eval_mismatch2 %>%
+    rmse(truth = known_mm, estimate=impute_mm) %>%
+    dplyr::select(rmse2 = .estimate)
+  
+  mismatch_rmse[[p]] <- bind_cols(eval_rmse1, eval_rmse2)
+  
+  # Imputing states seems to be more accurate?
+  
+  # Evaluate different imputing algorithms?
+  
+  # Do the resamples in phylogenetic distance bins?
+  
+}
+
+
+# Arrange on tree
+tree <- readRDS("output/rds/supertree.rds")
+
+# Filter summaries to just those in tree
+mismatch_summaries <- mismatch %>% 
+  mutate(species = template %>% str_remove("^.*;")) %>%
+  dplyr::filter(species %in% (tree$tip.label)) %>%
+  group_by(species, primer, direction) %>%
+  summarise(values = mean(sum, na.rm=TRUE))
+
+## Get values for higher nodes with castor
+uprimers <- unique(mismatch_summaries$primer)
+p_weights <- vector("list", length=length(uprimers))
+names(p_weights) <- uprimers
+
+for (i in 1:length(uprimers)){
+  print(paste0("Processing Primer ",i, " of ", length(uprimers), ": ", uprimers[i]))
+  # Prune tree to tips
+  tips_to_keep <- tree$tip.label %>% 
+    enframe(name=NULL, value="tips") %>% 
+    filter(tips %in% (mismatch_summaries %>% 
+                        filter(primer==uprimers[i]) %>%
+                        pull(species))) %>%
+    distinct()
+  
+  #Get subtree of only genera
+  pruned_tree  <- castor::get_subtree_with_tips(tree,
+                                            only_tips = unique(tips_to_keep$tips),
+                                            collapse_monofurcations=TRUE,
+                                            force_keep_root=TRUE)$subtree
+  
+  Ntips 	<- length(pruned_tree$tip.label)
+  Nnodes 	<- pruned_tree$Nnode
+  cat(sprintf("Tree has %d nodes, %d tips and %d edges\n",Nnodes,Ntips,nrow(pruned_tree$edge)));
+  
+  # create internal node labels
+  pruned_tree$node.label <- NA
+  if(is.na(pruned_tree$node.label)){
+  	cat(sprintf("Adding node labels to full tree..\n"))
+  	pruned_tree$node.label = paste("node.", 1:Nnodes, sep = "") # don't use underscores, because some tree readers (e.g. rncl) interpret them as spaces
+  }
+  
+  # replace zero-length edges
+  if(any(pruned_tree$edge.length==0)){
+    epsilon = 0.1*min(pruned_tree$edge.length[pruned_tree$edge.length>0])
+  	cat(sprintf("Note: Some edges have length zero, which may break some of the HSP routines. Replacing zero-lengths with a tiny positive length (%g)..\n",epsilon))
+  	pruned_tree$edge.length[pruned_tree$edge.length==0] = epsilon
+  }
+    
+  tip_states <- mismatch_summaries %>%
+    dplyr::filter(primer==uprimers[i], species %in% tips_to_keep$tips) %>%
+    column_to_rownames("species")
+    
+  #pruned_tree$tip.label[!pruned_tree$tip.label %in% rownames(tip_states)]
+  
+  row2tip <- match(rownames(tip_states), pruned_tree$tip.label)
+  
+  #find non matching
+  rownames(tip_states)[is.na(row2tip)]
+  
+  tip_states <- tip_states[!is.na(row2tip),,drop = FALSE]
+  hsp_states <- castor::hsp_independent_contrasts(tree = pruned_tree,
+                                              tip_states = tip_states$values,
+                                              weighted = FALSE,
+                                              check_input = TRUE)$states
+  
+  # Get distance of each tip to tips that have data
+  target_tips <- match(tip_states %>% filter(!is.na(values)) %>% rownames(), pruned_tree$tip.label);
+  tip_dist <- castor::find_nearest_tips(pruned_tree, only_descending_tips=FALSE, 
+                                        target_tips=target_tips, as_edge_counts=FALSE, check_input=TRUE)
+  
+   p_weights[[i]] <- tip_states %>%
+    rownames_to_column("species") %>%
+    mutate(hsp = hsp_states[1:Ntips],
+           tip_dist =tip_dist$nearest_distance_per_tip[1:Ntips])
+}
+
+imputed <- mismatch_summaries %>%
+  ungroup() %>%
+    left_join(bind_rows(p_weights,.id = "primer") %>% dplyr::select(-values))%>%
+  filter(!is.na(hsp))
+
+
+gg.radar_imputed_f <- imputed %>%
+  mutate(genus = species  %>%
+           str_remove(" .*$")) %>%
+  filter(direction == "F") %>%
+  filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
+  group_by(genus, primer) %>%
+  summarise(mismatch = mean(hsp, na.rm=TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = genus,
+              values_from = mismatch,
+              values_fill=list(mismatch=0))%>%
+  mutate_at(vars(-primer), function(x) {1-scales::rescale(x)}) %>%
+  ggradar() 
+
+gg.radar_r <- mismatch %>%
+  mutate(genus = template %>% str_remove("^.*;") %>%
+           str_remove(" .*$"),
+         species = template %>% str_remove("^.*;")) %>%
+  filter(direction == "R") %>%
+  filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
+  group_by(genus, primer) %>%
+  summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = genus,
+              values_from = mismatch,
+              values_fill=list(mismatch=0))%>%
+  mutate_at(vars(-primer), function(x) {1-scales::rescale(x)}) %>%
+  ggradar() +
+  scale_color_brewer(palette="Set1")
+
+gg.radar_f / gg.radar_r
+
+
+```
+
+
+
 
 
 # Sequence logos

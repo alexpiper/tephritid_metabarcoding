@@ -84,12 +84,12 @@ replace_terminal_N <- function(x, new="-"){
 
 # Evaluate primer ---------------------------------------------------------
 
-
-evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_position=NULL, mm_type=NULL, adjacent=2, count_gaps = FALSE, count_N = FALSE){
+evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_position=NULL, mm_type=NULL,
+                            adjacent=2, gaps = "impute", ambig = "impute", tree=NULL, quiet=FALSE){
   
   # Verify inputs
   if(is.null(mm_position)){
-    message("Using the default mismatch position scoring table from PrimerMiner (Position_v1)")
+    if(!quiet){message("Using the default mismatch position scoring table from PrimerMiner (Position_v1)")}
     mm_position <- c(242.4, 202.8, 169.8, 142.4, 119.5, 100.4, 84.5, 71.2,
                      60.2, 51, 43.3, 36.9, 31.6, 27.2, 23.5, 20.4, 17.8, 15.7,
                      13.9, 12.4, 11.2, 10.2, 9.3, 8.6, 8, 7.5, 7.1, 6.7, 6.4,
@@ -98,7 +98,7 @@ evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_positio
     mm_position <- as.data.frame(tibble::enframe(mm_position, name = "pos", value="score"))
   }
   if(is.null(mm_type)){
-    message("Using the default mismatch type scoring table from PrimerMiner (Position_v1)")
+    if(!quiet){message("Using the default mismatch type scoring table from PrimerMiner (Position_v1)")}
     mm_type <- as.data.frame(tibble::tribble(
       ~X, ~A, ~T, ~C, ~G,
       "A", 2, NA, 0.5, 2,
@@ -106,6 +106,58 @@ evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_positio
       "C", 0.5, 1, 2, NA,
       "G", 2, 0.5, NA, 2,
     ))
+  }
+  # Gap handling
+  if(gaps == "impute"){
+    if(!quiet){message("Gaps are being imputed")}
+    impute_missing <- TRUE
+    count_gaps <- FALSE
+  } else if (gaps == "count"){
+    if(!quiet){message("Gaps are being counted")}
+    count_gaps <- TRUE
+    impute_missing <- FALSE
+  } else if (gaps == "skip"){
+    if(!quiet){message("Gaps are being skipped")}
+    count_gaps <- FALSE
+    impute_missing <- FALSE
+  } else{
+    stop("gaps must be one of 'count', 'skip', or 'impute'")
+  }
+  # ambiguity handling
+  if(ambig == "impute"){
+    if(!quiet){message("Ambiguities are being imputed")}
+    count_N <- FALSE
+    impute_ambiguities <- TRUE
+  } else if (gaps == "count"){
+    if(!quiet){message("Ambiguities are being counted")}
+    count_N <- TRUE
+    impute_missing <- FALSE
+  } else if (gaps == "skip"){
+    if(!quiet){message("Ambiguities are being skipped")}
+    count_N <- FALSE
+    impute_ambiguities <- FALSE
+  } else{
+    stop("ambig must be one of 'count', 'skip', or 'impute'")
+  }
+  
+  if(impute_missing & is(tree, "phylo")) {
+    # Prune tree to tips in x
+    pruned_tree  <- castor::get_subtree_with_tips(tree,
+                                                  only_tips = names(x),
+                                                  collapse_monofurcations=TRUE,
+                                                  force_keep_root=TRUE)$subtree
+    # create internal node labels
+    pruned_tree$node.label <- NA
+    if(is.na(pruned_tree$node.label)){
+      pruned_tree$node.label = paste("node.", 1:Nnodes, sep = "")
+    }
+    # replace zero-length edges
+    if(any(pruned_tree$edge.length==0)){
+      epsilon <- 0.1*min(pruned_tree$edge.length[pruned_tree$edge.length>0])
+      pruned_tree$edge.length[pruned_tree$edge.length==0] <- epsilon
+    }
+  } else if(impute_missing & is.null(tree)){
+    stop("A tree must be provided if impute_missing=TRUE")
   }
   
   # Define nucleotide table
@@ -126,10 +178,10 @@ evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_positio
     "H", "A or C or T", 1/3, 1/3, 1/3, 0, "D",
     "V", "A or C or G", 1/3, 0, 1/3, 1/3, "B",
     "N", "any base", 0.25, 0.25, 0.25, 0.25, "N",
-    "I", "inosine", 0.25, 0.25, 0.25, 0.25, "N",
+    "I", "inosine", 0.25, 0.25, 0.25, 0.25, "N"
   ))
   
-  # if positons is character of lenght 2, its start and end position of primer
+  # if positions is character of length 2, its start and end position of primer
   if (is(positions, "numeric") & length(positions) == 2){
     start <- sort(positions)[1]
     stop <- sort(positions)[2]
@@ -152,7 +204,7 @@ evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_positio
   # Turn alignment into matrix
   alignment <- matrix(unlist(ape::as.character.DNAbin(x)), ncol = length(x[[1]]), byrow = TRUE)
   rownames(alignment) <- names(x)
-  alignment <- apply(alignment,2,toupper)
+  alignment <- apply(alignment, 2 ,toupper)
   
   # extract primer binding region
   primer_region <- alignment[,start:stop]
@@ -180,6 +232,38 @@ evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_positio
   
   # Score mismatches for each base in primer
   for(i in 1:length(primer_split)){
+    n_missing <- sum(is.na(primer_region[,i]))
+    
+    # if replace ambiguities, convert any N to NA
+    if(impute_ambiguities){
+      n_ambig <- sum(primer_region[,i] %in% upac$ID[5:length(upac$ID)])
+      primer_region[,i][primer_region[,i] %in% upac$ID[5:length(upac$ID)]] <- NA
+    } else {
+      n_ambig <- 0
+    }
+    n_to_impute <- sum(n_missing, n_ambig)
+    # impute any NA's before calculating mismatch
+    if(impute_missing & n_to_impute > 0){
+      if(!quiet){message(paste0("Imputing ",n_missing , " missing and ",n_ambig, " ambiguous state/s for position ",i, " of primer ", primer,"\n" ))}
+      tip_states <- primer_region[,i]
+      
+      # Map DNA characters to numeric states
+      state_mapping <- map_to_state_space(tip_states)
+      tip_states2 <- state_mapping$mapped_states
+      names(tip_states2) <- names(tip_states)
+      row2tip <- match(names(tip_states2), pruned_tree$tip.label)
+      Ntips 	<- length(pruned_tree$tip.label)
+      Nnodes 	<- pruned_tree$Nnode
+      tip_states <- tip_states[!is.na(row2tip),drop = FALSE]
+      hsp_states <- castor::hsp_independent_contrasts(tree = pruned_tree,
+                                                      tip_states = tip_states2,
+                                                      weighted = FALSE,
+                                                      check_input = TRUE)$states
+      #map back to real states
+      imputed_tip_states <- hsp_states[1:Ntips]
+      primer_region[,i] <- state_mapping$state_names[imputed_tip_states]
+    }
+    
     # Check for degenerate bases in sequ
     sequ <- upac[match(primer_region[,i], upac$ID), 3:6]
     sequ <- data.frame(sequ > 0)
@@ -278,7 +362,7 @@ evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_positio
     exp[k] <- paste(primer_region[k,], collapse="")
   }
   
-  mm_scores <- data.frame(template = names(x), "template"= exp, mm_scores, "sum"=rowSums(mm_scores), direction=direction)
+  mm_scores <- data.frame(template_name = names(x), "template_seq"= exp, mm_scores, "sum"=rowSums(mm_scores), direction=direction)
   #row.names(mm_scores) <- names(x)
   
   if(primer_region_1){mm_scores <- mm_scores[1,]}# remove duplicated row, as only one sequence
