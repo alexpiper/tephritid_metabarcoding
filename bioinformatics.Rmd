@@ -1,0 +1,1752 @@
+---
+title: "iMapPESTS local metabarcoding workflow"
+author: "A.M. Piper"
+date: "`r Sys.Date()`"
+output:
+  
+  html_document:
+    highlighter: null
+    theme: "flatly"
+    code_download: true
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    df_print: paged    
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Knitr global setup - change eval to true to run code
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE, eval=FALSE, message=FALSE,error=FALSE, fig.show = "hold", fig.keep = "all")
+opts_chunk$set(dev = 'png')
+```
+
+# Demultiplex sequencing reads
+For this workflow to run, we need to first demultiplex the miseq run again as the miseq does not put indexes in fasta headers by default, and also obtain some necessary files from the sequencing folder. The below code is written for the Agriculture Victoria BASC server, and the locations will be different if you are using a different HPC cluster.
+
+The output directory should be unique for each sequencing run, named as the flowcell id, within a directory called data
+
+For example:
+
+    root/
+      ├── data/
+         ├── CJL7D/
+
+BASH:
+```{bash demultiplex 1 mismatch}
+#load module
+module load bcl2fastq2/2.20.0-foss-2018b
+
+#raise amount of available file handles
+ulimit -n 4000
+
+###Run1
+
+#Set up input and outputs
+inputdir=/group/sequencing/211119_M01054_0740_000000000-K3DVL #CHANGE TO YOUR SEQ RUN
+outputdir=/group/pathogens/Alexp/Metabarcoding/tephritid_metabarcoding/data/K3DVL #CHANGE TO YOUR DATA FOLDER RUN
+samplesheet=/group/pathogens/Alexp/Metabarcoding/tephritid_metabarcoding/data/K3DVL/SampleSheet_K3DVL.csv #CHANGE TO YOUR SAMPLESHEET
+
+# convert samplesheet to unix format
+dos2unix $samplesheet
+
+#Demultiplex
+bcl2fastq -p 12 --runfolder-dir $inputdir \
+--output-dir $outputdir \
+--sample-sheet $samplesheet \
+--no-lane-splitting --barcode-mismatches 1
+
+# Copy other necessary files and move fastqs
+cd $outputdir
+cp -r $inputdir/InterOp $outputdir
+cp $inputdir/RunInfo.xml $outputdir
+cp $inputdir/runInfo.xml $outputdir
+cp $inputdir/runParameters.xml $outputdir
+cp $inputdir/RunParameters.xml $outputdir
+cp $samplesheet $outputdir
+mv **/*.fastq.gz $outputdir
+
+# Append fcid to start of sample names if missing
+fcid=$(echo $inputdir | sed 's/^.*-//')
+for i in *.fastq.gz; do
+  if ! [[ $i == $fcid* ]]; then
+  new=$(echo ${fcid} ${i}) #append together
+  new=$(echo ${new// /_}) #remove any whitespace
+  mv -v "$i" "$new"
+  fi
+done
+
+```
+
+# Optional: Run R on BASC
+You may wish to run this workflow through the BASC command line in order to take advantage of more processing power. To do this, you can start a new SLURM interactive session. Press the CODE button to the lower right to display the code for this optional step.
+
+```{bash, class.source = 'fold-hide'}
+# Create new interactive SLURM session
+sinteractive --ntasks=1 --cpus-per-task=10 --mem-per-cpu=10GB --time=72:00:00
+
+module load R/4.1.0-foss-2021a
+module load pkgconfig/1.5.1-GCCcore-9.3.0-Python-3.8.2
+module load GDAL/3.3.0-foss-2021a
+module load BLAST+/2.11.0-gompi-2020a
+module load Pandoc/2.5
+
+# Load R
+R
+
+# Run quit() to quit R once you are finished
+```
+
+
+# Install and load R packages and setup directories {.tabset}
+
+The seqateurs R package also provides wrappers around other software packages for QC. For convenience we will download and install these software in a new folder called "bin"
+
+```{r Manual install} 
+#Set required packages
+.cran_packages <- c(
+  "devtools",
+  "ggplot2",
+  "gridExtra",
+  "data.table",
+  "tidyverse", 
+  "stringdist",
+  "patchwork",
+  "vegan",
+  "seqinr",
+  "patchwork",
+  "stringi",
+  "phangorn",
+  "magrittr",
+  "galah"
+  )
+
+.bioc_packages <- c(
+  "phyloseq",
+  "DECIPHER",
+  "Biostrings",
+  "ShortRead",
+  "ggtree",
+  "savR",
+  "dada2",
+  "ngsReports"
+  )
+
+.inst <- .cran_packages %in% installed.packages()
+if(any(!.inst)) {
+   install.packages(.cran_packages[!.inst])
+}
+.inst <- .bioc_packages %in% installed.packages()
+if(any(!.inst)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)){
+    install.packages("BiocManager")
+  }
+  BiocManager::install(.bioc_packages[!.inst], ask = F)
+}
+
+#Load all published packages
+sapply(c(.cran_packages,.bioc_packages), require, character.only = TRUE)
+
+# Install and load github packages
+devtools::install_github("alexpiper/seqateurs", dependencies = TRUE)
+library(seqateurs)
+
+devtools::install_github("alexpiper/taxreturn", dependencies = TRUE)
+library(taxreturn)
+
+devtools::install_github("alexpiper/afdscraper", dependencies = TRUE)
+library(afdscraper)
+
+devtools::install_github("mikemc/speedyseq", dependencies = TRUE)
+library(speedyseq)
+
+#Install bbmap if its not in $path or in bin folder
+if(Sys.which("bbduk") == "" & !file.exists("bin/bbmap/bbduk.sh")){
+  seqateurs::bbmap_install(dest_dir = "bin")
+}
+
+#Install fastqc if its not in $path or in bin folder
+if(Sys.which("fastqc") == "" & !file.exists("bin/FastQC/fastqc")){
+  seqateurs::fastqc_install(dest_dir = "bin")
+}
+
+#Install BLAST if its not in $path or in bin folder
+#if(Sys.which("blastn") == "" & (length(fs::dir_ls("bin", glob="*blastn.exe",recurse = TRUE)) ==0)){
+#  taxreturn::blast_install(dest_dir = "bin")
+#}
+
+# Create directories
+if(!dir.exists("data")){dir.create("data", recursive = TRUE)}
+if(!dir.exists("reference")){dir.create("reference", recursive = TRUE)}
+if(!dir.exists("output/logs")){dir.create("output/logs", recursive = TRUE)}
+if(!dir.exists("output/results")){dir.create("output/results", recursive = TRUE)}
+if(!dir.exists("output/rds")){dir.create("output/rds", recursive = TRUE)}
+if(!dir.exists("sample_data")){dir.create("sample_data", recursive = TRUE)}
+if(!dir.exists("output/results/final")) {dir.create("output/results/final", recursive = TRUE)}
+if(!dir.exists("output/results/unfiltered")) {dir.create("output/results/unfiltered", recursive = TRUE)}
+if(!dir.exists("output/results/filtered")) {dir.create("output/results/filtered", recursive = TRUE)}
+```
+
+# Create sample sheet 
+
+The directory structure should now look something like this:
+
+    root/
+    ├── data/
+    │   ├── CJL7D/
+    │   │  ├── R1.fastq.gz
+    │   │  ├── R2.fastq.gz
+    │   │  ├── runInfo.xml
+    │   │  ├── runParameters.xml
+    │   │  ├── SampleSheet.csv
+    │   │  └── InterOp/
+    │   └── fcid2/
+    ├── sample_data/
+    ├── reference
+    ├── bin
+    ├── output/
+    └── doc/
+
+The reference and bin folders can be copied from previous runs. 
+
+In order to track samples and relevant QC statistics throughout the metabarcoding pipeline, we will first create a new samplesheet from our input samplesheets. This function requires both the SampleSheet.csv used for the sequencing run, and the runParameters.xml, both of which should have been automatically obtained from the demultiplexed sequencing run folder in the bash step above
+
+```{r create samplesheet}
+runs <- dir("data/") #Find all directories within data
+SampleSheet <- list.files(paste0("data/", runs), pattern= "SampleSheet", full.names = TRUE)
+runParameters <- list.files(paste0("data/", runs), pattern= "[Rr]unParameters.xml", full.names = TRUE)
+
+# Create samplesheet containing samples and run parameters for all runs
+samdf <- create_samplesheet(SampleSheet = SampleSheet, runParameters = runParameters, template = "V4") %>%
+  distinct()
+
+# Merge in existing sample_info metadata file if you have one
+sample_info <- readxl::read_excel("sample_data/sample_infoV4.xlsx", sheet="SAMPLESHEET")
+samdf <- coalesce_join(samdf, sample_info, by="sample_id")
+
+# Create logfile containing samples and run parameters for all runs
+logdf <- create_logsheet(SampleSheet = SampleSheet, runParameters = runParameters) %>%
+  distinct()
+
+#Check logdf and samdf are the same length
+if(!nrow(samdf) == nrow(logdf)){
+  warning("Samdf and logdf do not contain the same number of rows!")
+}
+
+# Check if sampleids contain fcid, if not; attatch
+samdf <- samdf %>%
+  mutate(sample_id = case_when(
+    !str_detect(sample_id, fcid) ~ paste0(fcid,"_",sample_id),
+    TRUE ~ sample_id
+  ))
+logdf <- logdf %>%
+  mutate(sample_id = case_when(
+    !str_detect(sample_id, fcid) ~ paste0(fcid,"_",sample_id),
+    TRUE ~ sample_id
+  ))
+
+# Check if samples match samplesheet
+fastqFs <- purrr::map(list.dirs("data", recursive=FALSE),
+                      list.files, pattern="_R1_", full.names = TRUE) %>%
+  unlist() %>%
+  str_remove(pattern = "^(.*)\\/") %>%
+  str_remove(pattern = "(?:.(?!_S))+$")
+fastqFs <- fastqFs[!str_detect(fastqFs, "Undetermined")]
+
+#Check missing in samplesheet
+if (length(setdiff(fastqFs, samdf$sample_id)) > 0) {warning("The fastq file/s: ", setdiff(fastqFs, samdf$sample_id), " are not in the sample sheet") }
+
+#Check missing fastqs
+if (length(setdiff(samdf$sample_id, fastqFs)) > 0) {
+  warning(paste0("The fastq file: ",
+                 setdiff(samdf$sample_id, fastqFs),
+                 " is missing, dropping from samplesheet \n")) 
+  samdf <- samdf %>%
+    filter(!sample_id %in% setdiff(samdf$sample_id, fastqFs))
+  logdf <- logdf %>%
+    filter(!sample_id %in% setdiff(logdf$sample_id, fastqFs))
+}
+
+# Add primer sequences
+
+samdf <- samdf %>%
+  mutate(pcr_primers = case_when(
+    str_detect(sample_id, "_fwh")  ~ "fwhF2-fwhR2nDac",
+    str_detect(sample_id, "_EIF")  ~ "EIF3LminiF4-EIF3lminiR4"
+  ),
+  for_primer_seq = case_when(
+    str_detect(sample_id, "_fwh")  ~ "GGDACWGGWTGAACWGTWTAYCCHCC",
+    str_detect(sample_id, "_EIF")  ~ "GATGCGYCGTTATGCYGATGC"
+  ),
+  rev_primer_seq = case_when(
+    str_detect(sample_id, "_fwh")  ~ "GTRATWGCHCCIGCTAADACHGG",
+    str_detect(sample_id, "_EIF")  ~ "TTRAAYACTTCYARATCRCC"    
+  )
+  )
+
+#Write out updated sample CSV for use
+write_csv(samdf, "sample_data/Sample_info.csv")
+write_csv(logdf, "output/logs/logdf.csv")
+
+```
+
+# Quality checks:
+
+We will conduct 3 quality checks. Firstly a check of the entire sequence run, followed by a sample level quality check to identify potential issues with specific samples. And then a calculation of the index switching rate by summarising correctly assigned vs missasigned indices.
+
+```{r QC}
+#Load sample sheet
+samdf <- read.csv("sample_data/Sample_info.csv", stringsAsFactors = FALSE)
+runs <- unique(samdf$fcid)
+
+flowcells <- vector("list", length=length(runs))
+for (i in 1:length(runs)){
+  ## Run level quality check using savR
+  path <- paste0("data/", runs[i], "/")
+  flowcells[[i]] <- savR(path)
+  fc <- flowcells[[i]]
+  qc.dir <- paste0("output/logs/", runs[i],"/" )
+  dir.create(qc.dir, recursive = TRUE)
+  write_csv(correctedIntensities(fc), paste0(qc.dir, "correctedIntensities.csv"))
+  write_csv(errorMetrics(fc), paste0(qc.dir, "errorMetrics.csv"))
+  write_csv(extractionMetrics(fc), paste0(qc.dir, "extractionMetrics.csv"))
+  write_csv(qualityMetrics(fc), paste0(qc.dir, "qualityMetrics.csv"))
+  write_csv(tileMetrics(fc), paste0(qc.dir, "tileMetrics.csv"))
+
+  avg_intensity <- fc@parsedData[["savCorrectedIntensityFormat"]]@data %>%
+    group_by(tile, lane) %>%
+    summarise(Average_intensity = mean(avg_intensity)) %>% 
+    ungroup() %>%
+    mutate(side = case_when(
+      str_detect(tile, "^11") ~ "Top",
+      str_detect(tile, "^21") ~ "Bottom"
+        ))%>%
+    ggplot(aes(x=lane, y=as.factor(tile), fill=Average_intensity)) +
+    geom_tile() +
+    facet_wrap(~side, scales="free") +
+    scale_fill_viridis_c()
+  
+  pdf(file=paste(qc.dir, "/avgintensity.pdf", sep=""), width = 11, height = 8 , paper="a4r")
+  plot(avg_intensity)
+  try(dev.off(), silent=TRUE)
+  
+  pdf(file=paste(qc.dir, "/PFclusters.pdf", sep=""), width = 11, height = 8 , paper="a4r")
+  pfBoxplot(fc)
+  try(dev.off(), silent=TRUE)
+
+  for (lane in 1:fc@layout@lanecount) {
+  pdf(file=paste(qc.dir, "/QScore_L", lane, ".pdf", sep=""), width = 11, height = 8 , paper="a4r")
+      qualityHeatmap(fc, lane, 1:fc@directions)
+  try(dev.off(), silent=TRUE)
+  } 
+}
+#Update log DF
+logdf <- read_csv("output/logs/logdf.csv")
+
+# Track reads
+logdf <- logdf %>% 
+  left_join(
+    flowcells %>%
+  purrr::map(~{.x@parsedData[["savTileFormat"]]@data %>%
+  dplyr::filter(code %in% c(100,101)) %>%
+  dplyr::mutate(code = case_when(
+    code == 100 ~ "reads_total",
+    code == 101 ~ "reads_pf"
+  ))}) %>%
+  purrr::set_names(runs) %>%
+  bind_rows(.id="fcid") %>% 
+  group_by(fcid, code) %>%
+  summarise(reads = sum(value)) %>%
+  pivot_wider(names_from = code,
+              values_from = reads),
+  by="fcid")
+  
+write_csv(logdf, "output/logs/logdf.csv")
+
+## Sample level quality check using fastqc
+for (i in 1:length(runs)){
+  path <- paste0("data/", runs[i], "/")
+  qc.dir <- paste0("output/logs/", runs[i],"/FASTQC" )
+  dir.create(qc.dir, recursive=TRUE)
+  qc_out <- seqateurs::fastqc(fq.dir = path, qc.dir	= qc.dir, fastqc.path = "bin/FastQC/fastqc", threads=2)
+  writeHtmlReport(qc.dir, overwrite = TRUE, gcType ="Genome",  quiet=FALSE)
+}
+
+## Calculate index switching
+for (i in 1:length(runs)){
+  path <- paste0("data/", runs[i], "/")
+  qc.dir <- paste0("output/logs/", runs[i] )
+  run_data <- samdf %>%
+    filter(fcid == runs[i])
+
+  indices <- sort(list.files(path, pattern="_R1_", full.names = TRUE)) %>%
+    purrr::set_names() %>%
+    purrr::map(seqateurs::summarise_index) %>%
+    bind_rows(.id="Sample_Name")%>%
+    arrange(desc(Freq)) %>% 
+    dplyr::mutate(Sample_Name = Sample_Name %>% 
+                    str_remove(pattern = "^(.*)\\/") %>%
+                    str_remove(pattern = "(?:.(?!_S))+$"))
+
+  if(!any(str_detect(indices$Sample_Name, "Undetermined"))){
+    stop("Error, an Undetermined reads fastq must be present to calculate index switching")
+    }
+  
+  combos <- indices %>% 
+    dplyr::filter(!str_detect(Sample_Name, "Undetermined")) %>%
+    dplyr::select(index, index2) %>%
+    tidyr::expand(index, index2)
+
+  #get unused combinations resulting from index switching
+  switched <- left_join(combos, indices, by=c("index", "index2")) %>%
+    drop_na()
+  
+  other_reads <- anti_join(indices,combos, by=c("index", "index2")) %>%
+    summarise(sum = sum(Freq)) %>%
+    pull(sum)
+  
+  #Summary of index switching rate
+  exp_rate <- switched %>% 
+    filter(!str_detect(Sample_Name, "Undetermined"))
+  obs_rate <- switched %>% 
+    filter(str_detect(Sample_Name,"Undetermined"))
+  switch_rate <- (sum(obs_rate$Freq)/sum(exp_rate$Freq))
+    message("Index switching rate calculated as: ", switch_rate)
+
+  #Plot switching
+    gg.switch <- switched %>%
+     # mutate(index = factor(index, levels = index),
+     #        index2 = factor(index2, levels = index)) %>%
+      ggplot(aes(x = index, y = index2), stat="identity") +
+    geom_tile(aes(fill = Freq),alpha=0.8)  + 
+    scale_fill_viridis_c(name="log10 Reads", begin=0.1, trans="log10")+
+    theme(axis.text.x = element_text(angle=90, hjust=1), 
+          plot.title=element_text(hjust = 0.5),
+          plot.subtitle =element_text(hjust = 0.5)#,
+          #legend.position = "none"
+          ) +
+    labs(title= runs[i], subtitle = paste0(
+      "Total Reads: ", sum(indices$Freq),
+      ", Switch rate: ", sprintf("%1.4f%%", switch_rate*100),
+      ", other Reads: ", other_reads)) 
+  pdf(file=paste(qc.dir, "/switchrate.pdf", sep=""), width = 11, height = 8 , paper="a4r")
+      plot(gg.switch)
+  try(dev.off(), silent=TRUE)
+  
+  }
+```
+
+# Trim Primers {.tabset}
+
+DADA2 requires Non-biological nucleotides i.e. primers, adapters, linkers, etc to be removed. Following demultiplexing however primer sequences still remain in the reads and must be removed prior to use with the DADA2 algorithm. 
+For this workflow we will be using the Kmer based adapter trimming software BBDuk (Part of BBTools package https://jgi.doe.gov/data-and-tools/bbtools/) to trim the primers from our raw data files. the seqateurs R package contains a wrapper fucntion to call bbduk from R to trim primers.
+
+If multiple primers have been multiplexed per library, use the multiplexed primer option below, otherwise proceed with the regular single primer workflow.
+
+## Single primer
+
+This workflow is for a single primer-pair per library. For this workflow to run, the pcr_primers, for_primer_seq and rev_primer_seq fields in the sample sheet must contain the primer information.
+
+```{r single primer trimming , message=FALSE}
+#Load sample sheet
+samdf <- read.csv("sample_data/Sample_info.csv", stringsAsFactors = FALSE)
+logdf <- read_csv("output/logs/logdf.csv")
+runs <- unique(samdf$fcid)
+
+#Create lists to track reads
+trimmed <- vector("list", length = length(runs))
+demux <- vector("list", length = length(runs))
+
+#Check primers are present
+if(any(is.na(samdf$for_primer_seq), is.na(samdf$rev_primer_seq))){warning("Some primer sequences are missing from samdf, check manually")}
+
+i=1
+for (i in 1:length(runs)){
+  path <- paste0("data/", runs[i])
+  qc.dir <- paste0("output/logs/", runs[i])
+
+  run_data <- samdf %>%
+    dplyr::filter(fcid == runs[i])
+  
+  #Get primer sequences
+  primers <- na.omit(c(unique(run_data$for_primer_seq), unique(run_data$rev_primer_seq)))
+  
+  # check if any samples need a second round of demultiplexing
+  twintagged <- any(str_detect(primers, ";"))
+  if (twintagged == TRUE) stop("Multiple primers are listed per sample in the sample data sheet, use the multi-primer workflow instead")
+
+  fastqFs <- sort(list.files(paste0(path), pattern="_R1_", full.names = TRUE))
+  fastqRs <- sort(list.files(paste0(path), pattern="_R2_", full.names = TRUE))
+  if(length(fastqFs) != length(fastqRs)) stop(paste0("Forward and reverse files for ",runs[i]," do not match."))
+    
+  # If there is multiple primer combination per run, do each seperately
+  primer_runs <- unique(run_data$pcr_primers)
+  
+  for (p in 1:length(primer_runs)){
+    primer_data <- run_data %>% dplyr::filter(pcr_primers == primer_runs[p])
+    
+    Fprimers <- unlist(str_split(unique(primer_data$for_primer_seq), ";"))
+    Rprimers <- unlist(str_split(unique(primer_data$rev_primer_seq), ";"))
+    
+    # Subset fastqs to only those samples with target primers
+    fastqFs_primer <- fastqFs[sapply(fastqFs, function(x){any(str_detect(x, primer_data$sample_id))})]
+    fastqRs_primer <- fastqRs[sapply(fastqRs, function(x){any(str_detect(x, primer_data$sample_id))})]
+
+    # TEST
+    trimmed[[i]] <- purrr::map2_dfr(fastqFs_primer, fastqRs_primer, function(x,y){
+        bbtrim2(install="bin/bbmap", fwd = x, rev = y,
+              primers = c(Fprimers, Rprimers), checkpairs = FALSE,
+              degenerate = TRUE, out.dir=file.path(path, "01_trimmed"), trim.end = "left", 
+              kmer=NULL, tpe=TRUE, tbo=TRUE,
+              ordered = TRUE, mink = FALSE, hdist = 2,
+              maxlength =(max(run_data$for_read_length,
+                              run_data$rev_read_length) - sort(nchar(c(Fprimers, Rprimers)),
+                              decreasing = FALSE)[1]) +5, 
+              force = TRUE, quiet=FALSE)
+      })
+  }
+  
+  # Check sequence lengths
+  pre_trim <- plot_lengths(dir=path, aggregate=TRUE, sample=1e5) + 
+    labs(title = runs[i], subtitle = "Pre-trimming")
+  post_trim <- plot_lengths(dir=paste0(path, "/01_trimmed/"), aggregate=TRUE, sample=1e5)+ 
+    labs(title = runs[i], subtitle = "Post-trimming")
+
+  pdf(file=file.path(qc.dir, "readlengths.pdf"), width = 11, height = 8 , paper="a4r")
+    plot(pre_trim)
+    plot(post_trim)
+  try(dev.off(), silent=TRUE)
+  
+  trim_summary <- trimmed[[i]] %>% 
+    mutate(perc_reads_remaining = signif(((output_reads / input_reads) * 100), 2),
+           perc_bases_remaining = signif(((output_bases / input_bases) * 100), 2)
+           ) %>%
+    filter(!is.na(perc_reads_remaining))
+    
+  message(paste0(signif(mean(trim_summary$perc_reads_remaining, na.rm = TRUE), 2),
+                 "% of reads and ",
+                 signif(mean(trim_summary$perc_bases_remaining, na.rm = TRUE), 2),
+                 "% of bases remaining for ", runs[i]," after trimming"))
+  
+  # Print warning for each sample
+  for(w in 1:nrow(trim_summary)){
+    if (trim_summary[w,]$perc_reads_remaining < 10) {message(paste0("WARNING: Less than 10% bases remaining for ",trim_summary[w,]$sample), ", check primer sequences are correct")}
+  }
+}
+
+# Track reads
+logdf <- logdf %>% 
+  left_join(
+    trimmed %>%
+    purrr::set_names(runs) %>%
+    bind_rows(.id="fcid") %>%
+    mutate(sample_id = str_replace(basename(sample), pattern="_S.*$", replacement=""),
+           reads_demulti = input_reads/2,
+           reads_trimmed = output_reads/2) %>%
+    dplyr::select(fcid, sample_id, reads_demulti, reads_trimmed),
+  by=c("sample_id", "fcid"))
+
+write_csv(logdf, "output/logs/logdf.csv")
+```
+
+
+## Multiplexed primers
+
+This workflow is for multiple primer-pairs per library. These could either be targeting different gene regions, taxa, or be twin-tagged replicate primers.
+
+For the multiplexed workflow to run, the pcr_primers, for_primer_seq and rev_primer_seq fields in the sample sheet must contain all primers separated by a semicolon ';' For example:
+
+pcr_primers
+Sterno18SF2-Sterno18SR2;Sterno12SF2-Sterno12SR2;SternoCOIF1-SternoCOIR1
+
+for_primer_seq
+ATGCATGTCTCAGTGCAAG;CAYCTTGACYTAACAT;ATTGGWGGWTTYGGAAAYTG
+
+rev_primer_seq
+TCGACAGTTGATAAGGCAGAC;TAAAYYAGGATTAGATACCC;TATRAARTTRATWGCTCCTA
+
+
+```{r multiplexed primer trimming , message=FALSE}
+#Load sample sheet
+samdf <- read.csv("sample_data/Sample_info.csv", stringsAsFactors = FALSE)
+logdf <- read_csv("output/logs/logdf.csv")
+runs <- unique(samdf$fcid)
+
+#Create lists to track reads
+trimmed <- vector("list", length = length(runs))
+demux <- vector("list", length = length(runs))
+
+#Check primers are present
+if(any(is.na(samdf$for_primer_seq), is.na(samdf$rev_primer_seq))){warning("Some primer sequences are missing from samdf, check manually")}
+
+# check if any samples need a second round of demultiplexing
+i=1
+for (i in 1:length(runs)){
+  path <- paste0("data/", runs[i])
+  qc.dir <- paste0("output/logs/", runs[i])
+
+  run_data <- samdf %>%
+    dplyr::filter(fcid == runs[i])
+  
+  #Get primer sequences
+  primers <- na.omit(c(unique(run_data$for_primer_seq), unique(run_data$rev_primer_seq)))
+
+  #Check if samples were twin tagged - these require extra round of demultiplexing
+  twintagged <- any(str_detect(primers, ";"))
+  if (twintagged == TRUE) {
+      # Create output directory
+      demuxpath <- file.path(path, "00_demux")
+      dir.create(demuxpath)
+
+      # Get list of fasta files
+      fastqFs <- sort(list.files(path, pattern="*R1_001.*", full.names = TRUE))
+      fastqRs <- sort(list.files(path, pattern="*R2_001.*", full.names = TRUE))
+        
+      # If there is multiple primer combination per run, do each seperately
+      primer_runs <- unique(run_data$pcr_primers)
+      for (p in 1:length(primer_runs)){
+        primer_data <- run_data %>% dplyr::filter(pcr_primers == primer_runs[p])
+        
+        Fprimers <- unlist(str_split(unique(primer_data$for_primer_seq), ";"))
+        Rprimers <- unlist(str_split(unique(primer_data$rev_primer_seq), ";"))
+        primer_names <- unlist(str_split(unique(primer_data$pcr_primers), ";"))
+        
+        # Subset fastqs to only those samples with target primers
+        fastqFs_primer <- fastqFs[sapply(fastqFs, function(x){any(str_detect(x, primer_data$sample_id))})]
+        fastqRs_primer <- fastqRs[sapply(fastqRs, function(x){any(str_detect(x, primer_data$sample_id))})]
+        
+        demux <- purrr::map2_dfr(fastqFs_primer, fastqRs_primer, function(x,y){
+          bbdemux2(install="bin/bbmap", fwd=x, rev=y, Fbarcodes = Fprimers, 
+                      Rbarcodes = Rprimers, names=primer_names, degenerate=TRUE, out.dir=demuxpath,
+                      threads=1 , mem=4,  hdist=0, force=TRUE)
+        })
+        
+        # Rename output files to match imappests format (FCID_sample_ext1_pcr1_CALngsF1-CALngsR1_S12_R1R2_001.fastq.gz)
+        old_names <- sort(list.files(paste0(demuxpath), pattern="_R1R2_", full.names = TRUE)) 
+        old_names <- old_names[sapply(old_names, function(x){any(str_detect(x, primer_data$sample_id))})]
+        new_names <- old_names %>%
+          basename() %>%
+          str_remove(".fastq.gz") %>%
+          str_split("_", n=Inf) %>%
+          purrr::map_chr(function(x){
+            paste0(paste0( c(x[1:4], x[length(x)], x[5:(length(x)-1)]), collapse = "_"),".fastq.gz")
+                      }) 
+        file.remove(file.path(dirname(old_names), new_names))
+        file.rename(old_names, file.path(dirname(old_names), new_names))
+
+        # Trim primers from demultiplexed fastq
+        demux_fastqs <- sort(list.files(paste0(demuxpath), pattern="_R1R2_", full.names = TRUE))
+        demux_fastqs <- demux_fastqs[sapply(demux_fastqs, function(x){any(str_detect(x, primer_data$sample_id))})]
+
+        trimmed[[i]] <- purrr::map_dfr(demux_fastqs, function(x){
+          bbtrim2(install="bin/bbmap", fwd = x,
+                primers = c(Fprimers, Rprimers), checkpairs = FALSE,
+                degenerate = TRUE, out.dir=file.path(path, "01_trimmed"), trim.end = "left", 
+                kmer=NULL, tpe=TRUE, tbo=TRUE,
+                ordered = TRUE, mink = FALSE, hdist = 2,
+                maxlength =(max(run_data$for_read_length, run_data$rev_read_length) - sort(nchar(c(Fprimers, Rprimers)), decreasing = FALSE)[1]) +5, force = TRUE, quiet=FALSE)
+        })
+        
+        # Re-split interleaved fastq's
+        trimmedpath <- file.path(path, "01_trimmed") 
+        trimmed_fastqs <- sort(list.files(trimmedpath, pattern="_R1R2_", full.names = TRUE))
+        purrr::walk(trimmed_fastqs, function(x){
+          bbsplit2(install="bin/bbmap", file=x, force=TRUE)
+        })
+        }
+    } else if (twintagged == FALSE) {
+      
+      fastqFs <- sort(list.files(paste0(path), pattern="_R1_", full.names = TRUE))
+      fastqRs <- sort(list.files(paste0(path), pattern="_R2_", full.names = TRUE))
+      if(length(fastqFs) != length(fastqRs)) stop(paste0("Forward and reverse files for ",runs[i]," do not match."))
+    
+      # If there is multiple primer combination per run, do each seperately
+      primer_runs <- unique(run_data$pcr_primers)
+      
+      for (p in 1:length(primer_runs)){
+        primer_data <- run_data %>% dplyr::filter(pcr_primers == primer_runs[p])
+        
+        Fprimers <- unlist(str_split(unique(primer_data$for_primer_seq), ";"))
+        Rprimers <- unlist(str_split(unique(primer_data$rev_primer_seq), ";"))
+        
+        # Subset fastqs to only those samples with target primers
+        fastqFs_primer <- fastqFs[sapply(fastqFs, function(x){any(str_detect(x, primer_data$sample_id))})]
+        fastqRs_primer <- fastqRs[sapply(fastqRs, function(x){any(str_detect(x, primer_data$sample_id))})]
+
+        trimmed[[i]] <- purrr::map2_dfr(fastqFs_primer, fastqRs_primer, function(x,y){
+            bbtrim2(install="bin/bbmap", fwd = x, rev = y,
+                  primers = c(Fprimers, Rprimers), checkpairs = FALSE,
+                  degenerate = TRUE, out.dir=file.path(path, "01_trimmed"), trim.end = "left", 
+                  kmer=NULL, tpe=TRUE, tbo=TRUE,
+                  ordered = TRUE, mink = FALSE, hdist = 2,
+                  maxlength =(max(run_data$for_read_length, run_data$rev_read_length) - sort(nchar(c(Fprimers, Rprimers)), decreasing = FALSE)[1]) +5, force = TRUE, quiet=FALSE)
+          })
+      }
+  }
+  
+  # Check sequence lengths
+  pre_trim <- plot_lengths(dir=path, aggregate=TRUE, sample=1e5) + 
+    labs(title = runs[i], subtitle = "Pre-trimming")
+  post_trim <- plot_lengths(dir=paste0(path, "/01_trimmed/"), aggregate=TRUE, sample=1e5)+ 
+    labs(title = runs[i], subtitle = "Post-trimming")
+
+  pdf(file=file.path(qc.dir, "readlengths.pdf"), width = 11, height = 8 , paper="a4r")
+    plot(pre_trim)
+    plot(post_trim)
+  try(dev.off(), silent=TRUE)
+  
+  trim_summary <- trimmed[[i]] %>% 
+    mutate(perc_reads_remaining = signif(((output_reads / input_reads) * 100), 2),
+           perc_bases_remaining = signif(((output_bases / input_bases) * 100), 2)
+           ) %>%
+    filter(!is.na(perc_reads_remaining))
+    
+  message(paste0(signif(mean(trim_summary$perc_reads_remaining, na.rm = TRUE), 2),
+                 "% of reads and ",
+                 signif(mean(trim_summary$perc_bases_remaining, na.rm = TRUE), 2),
+                 "% of bases remaining for ", runs[i]," after trimming"))
+  
+  # Print warning for each sample
+  for(w in 1:nrow(trim_summary)){
+    if (trim_summary[w,]$perc_reads_remaining < 10) {message(paste0("WARNING: Less than 10% bases remaining for ",trim_summary[w,]$sample), ", check primer sequences are correct")}
+  }
+}
+
+#Update the sample sheet and logging sheet to deal with any newly demultiplexed files
+demultiplexed_samples <- samdf %>%
+  dplyr::select(sample_id, pcr_primers)
+
+samdf <- samdf %>%
+ group_by(sample_id) %>%
+ group_split() %>%
+ purrr::map(function(x){
+   if(any(str_detect(x$pcr_primers, ";"))){
+     primer_names <- unlist(str_split(unique(x$pcr_primers), ";")) 
+     x %>% 
+       mutate(count = length(primer_names)) %>% #Replicate the samples
+       uncount(count) %>%
+       mutate(pcr_primers = unlist(str_split(unique(x$pcr_primers), ";")),
+              for_primer_seq = unlist(str_split(unique(x$for_primer_seq), ";")),
+              rev_primer_seq = unlist(str_split(unique(x$rev_primer_seq), ";")),
+              sample_id = paste0(sample_id, "_",pcr_primers)
+            ) 
+   } else (x)
+ }) %>%
+  bind_rows()
+
+logdf <- logdf %>%
+ left_join(demultiplexed_samples) %>%
+ group_by(sample_id) %>%
+ group_split() %>%
+ purrr::map(function(x){
+   if(any(str_detect(x$pcr_primers, ";"))){
+   x %>% 
+     mutate(count = length(primer_names)) %>% #Replicate the samples
+     uncount(count) %>%
+     mutate(pcr_primers = unlist(str_split(unique(x$pcr_primers), ";")),
+            sample_id = paste0(sample_id, "_",pcr_primers)
+            ) 
+   } else (x)
+ }) %>%
+  bind_rows()
+
+# Track reads
+logdf <- logdf %>% 
+  left_join(
+    trimmed %>%
+    purrr::set_names(runs) %>%
+    bind_rows(.id="fcid") %>%
+    mutate(sample_id = str_replace(basename(sample), pattern="_S.*$", replacement=""),
+           reads_demulti = input_reads/2,
+           reads_trimmed = output_reads/2) %>%
+    dplyr::select(fcid, sample_id, reads_demulti, reads_trimmed),
+  by=c("sample_id", "fcid"))
+
+write_csv(logdf, "output/logs/logdf.csv")
+```
+
+# Plot read quality & lengths {-}
+
+```{r QA plot, eval = FALSE, cache= TRUE}
+#Load sample sheet
+samdf <- read.csv("sample_data/Sample_info.csv", stringsAsFactors = FALSE)
+runs <- unique(samdf$fcid)
+
+# Plotting parameters
+readQC_aggregate <- TRUE
+readQC_subsample <-  12
+
+amplicon = 205 # Set to maximum size between the two primers. If working with variable barcode lengths, set to the expected or average amplicon length
+
+for (i in 1:length(runs)){
+  run_data <- samdf %>%
+    filter(fcid == runs[i])
+
+  path <- paste0("data/", runs[i], "/01_trimmed" )
+ 
+  ##Get trimmed files, accounting for empty files (28 indicates empty sample)
+  trimmedFs <- sort(list.files(path, pattern="_R1_", full.names = TRUE))
+  trimmedFs <- trimmedFs[!str_detect(trimmedFs, "Undetermined")]
+  trimmedFs <- trimmedFs[file.size(trimmedFs) > 28]
+
+  #Choose a random subsample for quality checks
+  sampleF <- sample(trimmedFs, readQC_subsample) #NOTE - need to have option to pass
+  sampleR <- sampleF %>% str_replace(pattern="_R1_", replacement = "_R2_")
+  
+  #Estimate an optimat trunclen
+  truncLen <- estimate_trunclen(sampleF, sampleR, maxlength=amplicon)
+
+  #Plot qualities
+  gg.Fqual <- plot_quality(sampleF) +
+    geom_vline(aes(xintercept=truncLen[1]), colour="blue") +
+    annotate("text", x = truncLen[1]-10, y =2, label = paste0("Suggested truncLen = ", truncLen[1]), colour="blue") +
+    ggtitle(paste0(runs[i], " Forward Reads")) +
+    scale_x_continuous(breaks=seq(0,300,25))
+  gg.Fee <- plot_maxEE(sampleF) + 
+    geom_vline(aes(xintercept=truncLen[1]), colour="blue")+
+    annotate("text", x = truncLen[1]-10, y =-3, label = paste0("Suggested truncLen = ", truncLen[1]), colour="blue") +
+    ggtitle(paste0(runs[i], " Forward Reads")) +
+    scale_x_continuous(breaks=seq(0,300,25)) +
+    theme(legend.position = "bottom")
+  gg.Rqual <- plot_quality(sampleR) + 
+    geom_vline(aes(xintercept=truncLen[2]), colour="blue")+
+    annotate("text", x = truncLen[1]-10, y =2, label = paste0("Suggested truncLen = ", truncLen[2]), colour="blue") +
+    ggtitle(paste0(runs[i], " Reverse Reads")) +
+    scale_x_continuous(breaks=seq(0,300,25)) +
+    theme(legend.position = "bottom")
+  gg.Ree <- plot_maxEE(sampleR) +
+    geom_vline(aes(xintercept=truncLen[2]), colour="blue")+
+    annotate("text", x = truncLen[1]-10, y =-3, label = paste0("Suggested truncLen = ", truncLen[2]), colour="blue") +
+    ggtitle(paste0(runs[i], " Reverse Reads")) +
+    scale_x_continuous(breaks=seq(0,300,25)) +
+    theme(legend.position = "bottom")
+
+  Qualplots <- (gg.Fqual + gg.Rqual) / (gg.Fee + gg.Ree)
+  
+  #output plots
+  pdf(paste0("output/logs/",runs[i],"/",runs[i], "_prefilt_quality.pdf"), width = 11, height = 8 , paper="a4r")
+  plot(Qualplots)
+  try(dev.off(), silent=TRUE)
+}
+```
+
+This has output a prefilt_quality.pdf plot for each of the runs analysed in the logs folder. On the top is the quality score per cycle, and on the bottom is the cumulative expected errors (calculated as EE = sum(10^(-Q/10)) on a log scale. For the quality plot, the median quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. For the maxEE lines, the red lines showing the expected error filter options. The blue vertical line on both plots shows the suggested truncLen option automatically determined. 
+
+Ensure that the blue suggested trunclen looks reasonable before continuing. Truncating length will reduce the number of reads violating the expected error filter, and therefore increase the number of reads proceding through the pipeline. The reverse reads will generally have lower quality, and therefore a lower truncLen than the forward reads.
+
+# Filter reads {.tabset}
+
+This stage will use read truncation and max expected error function to remove low quality reads and read tails. All reads containing N bases will also be removed. this will output _postfilt_quality.pdf in the logs folder to determine how sucessfull it has been in cleaning up the quality.
+
+## Non-length variable
+
+```{r filter and trunclen}
+samdf <- read.csv("sample_data/Sample_info.csv", stringsAsFactors = FALSE)
+runs <- unique(samdf$fcid)
+filtered_out <- vector("list", length=length(runs))
+
+# Set important variables for trimming
+maxEE <- 1 #Filter reads above Expected errors (EE = sum(10^(-Q/10))). Set higher for poor quality sequences.
+rm.lowcomplex <- 0 # Remove low-complexity, set higher for NovaSeq and other 2 colour platforms
+amplicon = 205 # Set to maximum size between the two primers. If working with variable barcode lengths, set to readlength
+
+# Estimate best length to truncate forward and reverse reads to
+truncLen <- 205
+
+for (i in 1:length(runs)){
+  
+   run_data <- samdf %>%
+    filter(fcid == runs[i])
+  
+  path <- paste0("data/", runs[i], "/01_trimmed" )
+  
+  filtpath <- paste0("data/", runs[i], "/02_filtered" ) # Filtered forward files go into the path/filtered/ subdirectory
+  dir.create(filtpath)
+  
+  fastqFs <- sort(list.files(path, pattern="_R1_001.*"))
+  fastqRs <- sort(list.files(path, pattern="_R2_001.*"))
+  
+  if(length(fastqFs) != length(fastqRs)) stop(paste0("Forward and reverse files for ",runs[i]," do not match."))
+  
+  filtered_out[[i]] <- filterAndTrim(fwd = file.path(path, fastqFs), filt = file.path(filtpath, fastqFs),
+                                      rev = file.path(path, fastqRs), filt.rev = file.path(filtpath, fastqRs),
+                                      maxEE = maxEE, truncLen = truncLen, rm.lowcomplex = rm.lowcomplex,
+                                      rm.phix = TRUE, matchIDs = TRUE, id.sep = "\\s",
+                                      multithread = TRUE, compress = TRUE, verbose = TRUE)
+
+  # post filtering plot
+  filtFs <- sort(list.files(filtpath, pattern="R1_001.*", full.names = TRUE))
+  sampleF <- sample(filtFs, readQC_subsample)
+  sampleR <- sampleF %>% str_replace(pattern="R1_001", replacement = "R2_001")
+  
+  p1 <- plotQualityProfile(sampleF, aggregate = readQC_aggregate) +
+    ggtitle(paste0(runs[i]," Forward Reads")) +
+    scale_x_continuous(breaks=seq(0,300,25))
+  p2 <- plotQualityProfile(sampleR, aggregate = readQC_aggregate) + 
+    ggtitle(paste0(runs[i]," Reverse Reads"))+
+    scale_x_continuous(breaks=seq(0,300,25))
+  
+  #output plots
+  if (!dir.exists("output/logs/")){ dir.create("output/logs/")}
+  pdf(paste0("output/logs/", runs[i],"/",runs[i], "_postfilt_quality.pdf"), width = 11, height = 8 , paper="a4r")
+  plot(p1)
+  plot(p2)
+  try(dev.off(), silent=TRUE)
+  
+  filtered_summary <- filtered_out[[i]] %>% 
+    as.data.frame() %>%
+    rownames_to_column("sample") %>%
+    mutate(reads_remaining = signif(((reads.out / reads.in) * 100), 2)) %>%
+    filter(!is.na(reads_remaining))
+    
+  message(paste0(signif(mean(filtered_summary$reads_remaining, na.rm = TRUE), 2), "% of reads remaining for ", runs[i]," after filtering"))
+  
+  # Print warning for each sample
+  for(w in 1:nrow(filtered_summary)){
+    if (filtered_summary[w,]$reads_remaining < 10) {
+      message(paste0("WARNING: Less than 10% reads remaining for ", filtered_summary[w,]$sample), "Check filtering parameters ")
+    } 
+  }
+  
+}
+
+#Update log DF
+logdf <- read_csv("output/logs/logdf.csv")
+
+logdf <- logdf %>%
+  left_join(filtered_out %>%
+    map(as_tibble, rownames=NA) %>%
+    map(rownames_to_column, var="sample_id") %>%
+    purrr::set_names(runs) %>%
+    bind_rows(.id="fcid") %>%
+    mutate(sample_id = str_replace(basename(sample_id), pattern="_S.*$", replacement="")) %>%
+    dplyr::select(fcid, sample_id, reads_qualfilt = reads.out),
+  by=c("sample_id", "fcid"))
+
+write_csv(logdf, "output/logs/logdf.csv")
+```
+
+## length variable marker
+
+The main difference between the filtering and trimming for a length variable marker, is we do not want to truncate the reads to a certain length, and instead use a minimum and maximum length.
+
+```{r filter and minlen}
+samdf <- read.csv("sample_data/Sample_info.csv", stringsAsFactors = FALSE)
+runs <- unique(samdf$fcid)
+filtered_out <- vector("list", length=length(runs))
+
+# Set important variables for trimming
+maxEE <- 1 #Filter reads above Expected errors (EE = sum(10^(-Q/10))). Set higher for poor quality sequences.
+rm.lowcomplex <- 0 # Remove low-complexity, set higher for NovaSeq and other 2 colour platforms
+minlength <- 50
+
+for (i in 1:length(runs)){
+  
+   run_data <- samdf %>%
+    filter(fcid == runs[i])
+  
+  path <- paste0("data/", runs[i], "/01_trimmed" )
+  
+  filtpath <- paste0("data/", runs[i], "/02_filtered" ) # Filtered forward files go into the path/filtered/ subdirectory
+  dir.create(filtpath)
+  
+  fastqFs <- sort(list.files(path, pattern="R1_001.*"))
+  fastqRs <- sort(list.files(path, pattern="R2_001.*"))
+  
+  if(length(fastqFs) != length(fastqRs)) stop(paste0("Forward and reverse files for ",runs[i]," do not match."))
+  
+  filtered_out[[i]] <- filterAndTrim(fwd = file.path(path, fastqFs), filt = file.path(filtpath, fastqFs),
+                                      rev = file.path(path, fastqRs), filt.rev = file.path(filtpath, fastqRs),
+                                      maxEE = maxEE, truncLen = 0, minLen = minlength, rm.lowcomplex = rm.lowcomplex,
+                                      rm.phix = TRUE, matchIDs = TRUE, id.sep = "\\s",
+                                      multithread = TRUE, compress = TRUE, verbose = TRUE)
+
+  # post filtering plot
+  filtFs <- sort(list.files(filtpath, pattern="R1_001.*", full.names = TRUE))
+  sampleF <- sample(filtFs, readQC_subsample)
+  sampleR <- sampleF %>% str_replace(pattern="R1_001", replacement = "R2_001")
+  
+  p1 <- plotQualityProfile(sampleF, aggregate = readQC_aggregate) +
+    ggtitle(paste0(runs[i]," Forward Reads")) +
+    scale_x_continuous(breaks=seq(0,300,25))
+  p2 <- plotQualityProfile(sampleR, aggregate = readQC_aggregate) + 
+    ggtitle(paste0(runs[i]," Reverse Reads"))+
+    scale_x_continuous(breaks=seq(0,300,25))
+  
+  #output plots
+  if (!dir.exists("output/logs/")){ dir.create("output/logs/")}
+  pdf(paste0("output/logs/", runs[i],"/",runs[i], "_postfilt_quality.pdf"), width = 11, height = 8 , paper="a4r")
+  plot(p1)
+  plot(p2)
+  try(dev.off(), silent=TRUE)
+  
+  filtered_summary <- filtered_out[[i]] %>% 
+    as.data.frame() %>%
+    rownames_to_column("sample") %>%
+    mutate(reads_remaining = signif(((reads.out / reads.in) * 100), 2)) %>%
+    filter(!is.na(reads_remaining))
+    
+  message(paste0(signif(mean(filtered_summary$reads_remaining, na.rm = TRUE), 2), "% of reads remaining for ", runs[i]," after filtering"))
+  
+  # Print warning for each sample
+  for(w in 1:nrow(filtered_summary)){
+    if (filtered_summary[w,]$reads_remaining < 10) {
+      message(paste0("WARNING: Less than 10% reads remaining for ", trim_summary[w,]$sample), "Check filtering parameters ")
+    } 
+  }
+  
+}
+
+#Update log DF
+logdf <- read_csv("output/logs/logdf.csv")
+
+logdf <- logdf %>%
+  left_join(filtered_out %>%
+    map(as_tibble, rownames=NA) %>%
+    map(rownames_to_column, var="sample_id") %>%
+    purrr::set_names(runs) %>%
+    bind_rows(.id="fcid") %>%
+    mutate(sample_id = str_replace(basename(sample_id), pattern="_S.*$", replacement="")) %>%
+    dplyr::select(fcid, sample_id, reads_qualfilt = reads.out),
+  by=c("sample_id", "fcid"))
+
+write_csv(logdf, "output/logs/logdf.csv")
+```
+
+
+# Infer sequence variants for each run {-}
+
+This workflow uses the DADA2 algorithm to differentiate real sequences from error using their abundance and co-occurance patters. This relies on the assumption of a random error process where base errors are introduced randomly by either PCR polymerase or sequencing, real sequences will be high quality in the same way, while bad sequences are bad in different individual ways. DADA2 depends on a parameterized error model (the 16(possible bases) × 41(phred score) transition probabilities, for example, p(A→C, 35)), which is estimated from the data. DADA2’s default parameter estimation method is to perform a weighted loess fit to the regularized log of the observed mismatch rates as a function of their quality, separately for each transition type (for example, A→C mismatches are fit separately from A→G mismatches). Following error model learning, all identical sequencing reads are dereplicated into into “Amplicon sequence variants” (ASVs) with a corresponding abundance equal to the number of reads with that unique sequence. The forward and reverse reads are then merged together by aligning the denoised forward reads with the reverse-complement of the corresponding reverse reads, and then constructing the merged “contig” sequences. Following this step, a sequence variant table is constructed and saved as an RDS file.
+
+```{r DADA}
+set.seed(100) # set random seed for reproducability
+samdf <- read.csv("sample_data/Sample_info.csv", stringsAsFactors = FALSE)
+runs <- unique(samdf$fcid)
+
+# Set parameters
+nbases = 1e+08 # Minimum number of total bases to use for error rate - increase if samples are deep sequenced (>1M reads per sample)
+randomize = TRUE # Pick samples randomly to learn errors
+pool = "pseudo" # Higher accuracy for low abundance at expense of runtime. Set to FALSE for a faster run
+
+dada_out <- vector("list", length=length(runs))
+i=1
+for (i in 1:length(runs)){
+  
+  run_data <- samdf %>%
+    filter(fcid == runs[i])
+  
+  #Check if run used twin tags
+  filtpath <- paste0("data/", runs[i], "/02_filtered" )
+  
+  filtFs <- list.files(filtpath, pattern="R1_001.*", full.names = TRUE)
+  filtRs <- list.files(filtpath, pattern="R2_001.*", full.names = TRUE)
+  
+  # Learn error rates from a subset of the samples and reads (rather than running self-consist with full dataset)
+  errF <- learnErrors(filtFs, multithread = TRUE, nbases = nbases, randomize = randomize, qualityType = "FastqQuality", verbose=TRUE)
+  errR <- learnErrors(filtRs, multithread = TRUE, nbases = nbases, randomize = randomize, qualityType = "FastqQuality", verbose=TRUE)
+  
+  #write out errors for diagnostics
+  write_csv(as.data.frame(errF$trans), paste0("output/logs/", runs[i],"/",runs[i],"_errF_observed_transitions.csv"))
+  write_csv(as.data.frame(errF$err_out), paste0("output/logs/", runs[i],"/",runs[i],"_errF_inferred_errors.csv"))
+  write_csv(as.data.frame(errR$trans), paste0("output/logs/", runs[i],"/",runs[i],"_errR_observed_transitions.csv"))
+  write_csv(as.data.frame(errR$err_out), paste0("output/logs/", runs[i],"/",runs[i],"_errR_inferred_errors.csv"))
+  
+  ##output error plots to see how well the algorithm modelled the errors in the different runs
+  p1 <- plotErrors(errF, nominalQ = TRUE) + ggtitle(paste0(runs[i], " Forward Reads"))
+  p2 <- plotErrors(errR, nominalQ = TRUE) + ggtitle(paste0(runs[i], " Reverse Reads"))
+  pdf(paste0("output/logs/", runs[i],"/",runs[i],"_errormodel.pdf"), width = 11, height = 8 , paper="a4r")
+  plot(p1)
+  plot(p2)
+  try(dev.off(), silent=TRUE)
+  
+  #Error inference and merger of reads
+  dadaFs <- dada(filtFs, err = errF, multithread = TRUE, pool = pool, verbose = TRUE)
+  dadaRs <- dada(filtRs, err = errR, multithread = TRUE, pool = pool, verbose = TRUE)
+  
+  # merge reads
+  mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE, minOverlap = 12, trimOverhang = TRUE) 
+  mergers <- mergers[sapply(mergers, nrow) > 0]
+  bind_rows(mergers, .id="Sample") %>%
+    mutate(Sample = str_replace(Sample, pattern="_S.*$", replacement="")) %>%
+    write_csv(paste0("output/logs/",runs[i],"/",runs[i], "_mergers.csv"))
+  
+  #Construct sequence table
+  seqtab <- makeSequenceTable(mergers)
+  saveRDS(seqtab, paste0("output/rds/", runs[i], "_seqtab.rds"))
+
+  # Track reads
+  getN <- function(x) sum(getUniques(x))
+  dada_out[[i]] <- cbind(sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN)) %>%
+    magrittr::set_colnames(c("dadaFs", "dadaRs", "merged")) %>%
+    as.data.frame() %>%
+    rownames_to_column("sample_id") %>%
+    mutate(sample_id = str_replace(basename(sample_id), pattern="_S.*$", replacement=""))
+}
+
+#Update log DF
+logdf <- read_csv("output/logs/logdf.csv")
+
+logdf <- logdf  %>% 
+  left_join(dada_out %>%
+            purrr::set_names(runs) %>%
+            bind_rows(.id="fcid") %>%
+            mutate(reads_denoised = case_when(
+              dadaFs < dadaRs ~ dadaFs,
+              dadaFs > dadaRs ~ dadaRs)) %>%
+            dplyr::select(fcid, sample_id, reads_denoised, reads_merged = merged),
+  by=c("sample_id", "fcid"))
+
+write_csv(logdf, "output/logs/logdf.csv")
+```
+
+# Merge Runs, Remove Chimeras and filter {.tabset}
+
+Following denoising and merging of reads, if there were multiple flowcells of data analyse the sequence tables from these will be merged together. Next the sequences are checked for chimeras, and all sequences containing stop codons are removed. The final cleaned sequence table is saved as output/rds/seqtab_final.rds
+
+Note: this will change if you are using a coding marker or not
+
+## Coding marker
+
+```{r chimera filt coding}
+seqtabs <- list.files("output/rds/", pattern="seqtab.rds", full.names = TRUE)
+
+# If multiple seqtabs present, merge.
+if(length(seqtabs) > 1){
+  st.all <- mergeSequenceTables(tables=seqtabs)
+} else if(length(seqtabs) == 1) {
+  st.all <- readRDS(seqtabs)
+}
+
+#Remove chimeras
+seqtab_nochim <- removeBimeraDenovo(st.all, method="consensus", multithread=TRUE, verbose=TRUE)
+message(paste(sum(seqtab_nochim)/sum(st.all),"of the abundance remaining after chimera removal"))
+
+#cut to expected size allowing for some codon indels - do separately for each loci
+seqtab_nochim_fwh <- seqtab_nochim[str_detect(rownames(seqtab_nochim), "_fwh_"),]
+seqtab_nochim_eif <- seqtab_nochim[str_detect(rownames(seqtab_nochim), "_EIF_"),]
+
+seqtab_cut_fwh <- seqtab_nochim_fwh[,nchar(colnames(seqtab_nochim_fwh)) %in% 200:210]
+seqtab_cut_eif <- seqtab_nochim_eif[,nchar(colnames(seqtab_nochim_eif)) %in% 211:223]
+
+# Align to phmm
+fwh_model <- taxreturn::subset_model(readRDS("diagnostic_alignments/model/Bactrocera_COI.rds"),
+                                 primers = c("GGDACWGGWTGAACWGTWTAYCCHCC", "GTRATWGCHCCIGCTAADACHGG"))
+
+eif_model <- taxreturn::subset_model(readRDS("diagnostic_alignments/model/Bactrocera_EIF3L.rds"),
+                                 primers = c("GATGCGYCGTTATGCYGATGC", "TTRAAYACTTCYARATCRCC"))
+
+
+seqs_fwh <- DNAStringSet(colnames(seqtab_cut_fwh))
+names(seqs_fwh) <- colnames(seqtab_cut_fwh)
+
+seqs_eif <- DNAStringSet(colnames(seqtab_cut_eif))
+names(seqs_eif) <- colnames(seqtab_cut_eif)
+
+phmm_filt_fwh <- taxreturn::map_to_model(seqs_fwh, model = fwh_model, min_score = 100, min_length = 100, shave = FALSE, check_frame = TRUE, kmer_threshold = 0.5, k=5, extra = "fill")
+
+phmm_filt_eif <- taxreturn::map_to_model(seqs_eif, model = eif_model, min_score = 100, min_length = 100, shave = FALSE, check_frame = TRUE, kmer_threshold = 0.5, k=5, extra = "fill")
+
+#Filter sequences containing stop codons
+codon_filt_fwh <- taxreturn::codon_filter(phmm_filt_fwh, genetic_code = "SGC4") # Invertebrate mito
+codon_filt_eif <- taxreturn::codon_filter(phmm_filt_eif, genetic_code = "SGC0") # Standard genetic code
+
+seqtab_final <- seqtab_nochim[,colnames(seqtab_nochim) %in% c(names(codon_filt_fwh), names(codon_filt_eif))]
+
+
+message(paste0("Identified ",
+               length(colnames(seqtab_nochim))  - length(colnames(seqtab_final)),
+               " sequences containing stop codon out of ", length(colnames(seqtab_nochim)) , " input sequences."))
+message(paste(sum(seqtab_final)/sum(seqtab_nochim),"of the abundance remaining after removing seqs with stop codons "))
+
+saveRDS(seqtab_final, "output/rds/seqtab_final.rds")
+
+# summarise cleanup
+cleanup <- st.all %>%
+  as.data.frame() %>%
+  pivot_longer( everything(),
+    names_to = "OTU",
+    values_to = "Abundance") %>%
+  group_by(OTU) %>%
+  summarise(Abundance = sum(Abundance)) %>%
+  mutate(length  = nchar(OTU)) %>%
+  mutate(type = case_when(
+    !OTU %in% getSequences(seqtab_nochim) ~ "Chimera",
+    !OTU %in% c(getSequences(seqtab_cut_fwh), getSequences(seqtab_cut_eif)) ~ "Incorrect size",
+    !OTU %in% c(names(phmm_filt_fwh), names(phmm_filt_eif)) ~ "PHMM",
+    !OTU %in% getSequences(seqtab_final) ~ "Stop codons",
+    TRUE ~ "Real"
+  )) 
+write_csv(cleanup, "output/logs/ASV_cleanup_summary.csv")
+
+#Update log DF
+logdf <- read_csv("output/logs/logdf.csv")
+
+logdf <- logdf %>% 
+  left_join(as.data.frame(cbind(rowSums(st.all),
+                                rowSums(seqtab_nochim),
+                                #rowSums(seqtab_cut),
+                                rowSums(seqtab_final))) %>%
+                            rownames_to_column("sample_id") %>%
+              mutate(sample_id = str_replace(basename(sample_id), pattern="_S.*$", replacement="")) %>%
+              dplyr::select(sample_id, reads_chimerafilt = V2, reads_sizefilt = V3),
+  by=c("sample_id"))
+
+write_csv(logdf, "output/logs/logdf.csv")
+
+# Output length distribution plots
+gg.abundance <- ggplot(cleanup, aes(x=length, y=Abundance, fill=type))+
+              geom_bar(stat="identity") + 
+              labs(title = "Abundance of sequences")
+
+gg.unique <- ggplot(cleanup, aes(x=length, fill=type))+
+            geom_histogram() + 
+            labs(title = "Number of unique sequences")
+
+pdf(paste0("output/logs/seqtab_length_dist.pdf"), width = 11, height = 8 , paper="a4r")
+  plot(gg.abundance / gg.unique)
+try(dev.off(), silent=TRUE)
+```
+
+# Assign taxonomy  {.tabset}
+
+Now that we have a cleaned table of sequences and their abundances across samples, we need to assign taxonomy to the sequences in order to identify taxa. The default approach is currently to use IDTAXA to assign heirarchial taxonomy, followed by a BLAST search for increased species level assignment. However there are a number of alternative classifiers you can use to do this, a few of which are represented in the tabs below.
+
+## IDTAXA + BLAST
+
+We will use the IDTAXA algorithm of Murali et al 2018 to assign taxonomy to the ASVs. IDTAXA requires a pre-trained classifier, which can be found in the reference folder, alternatively see the taxreturn r package if you wish to curate a reference database and train a new classifier.
+
+To increase classification to species level, we will also incorporate a BLAST search. However as top hit assignment methods such as BLAST do not take the context of other sequences into account, to reduce the risk of over-classification we will only assign an ASV to species rank if the BLAST search agrees with IDTAXA at the Genus rank. 
+
+```{r IDTAXA BLAST}
+seqtab_final <- readRDS("output/rds/seqtab_final.rds")
+
+# NOTE: these ranks may differ for different training sets. Check your training set to avoid an error
+ranks <-  c("Root","Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") 
+
+# Add ref_db column to the sample sheet
+samdf <- read_csv("sample_data/Sample_info.csv")
+
+samdf <- samdf %>%
+  mutate(
+  ref_db = case_when(
+    str_detect(sample_id, "_fwh") ~  "reference/COI_idtaxa.rds",
+    str_detect(sample_id, "_EIF") ~  "reference/EIF3L_idtaxa.rds"
+  ),
+  blast_db = case_when(
+    str_detect(sample_id, "_fwh") ~  "reference/COI_hierarchial.fa",
+    str_detect(sample_id, "_EIF") ~  "reference/EIF3L_hierarchial.fa"
+  ))
+  
+write_csv(samdf, "output/logs/samdf_refs.csv")
+  
+# get list of all dbs
+all_dbs <- unique(samdf$ref_db)
+blast_dbs <- unique(samdf$blast_db)
+
+# Also create a list to keep the classified taxonomy
+taxtab_list <- vector("list", length=length(all_dbs))
+
+# loop through each db
+for (r in 1:length(all_dbs)){
+  
+  # Load the relevent db
+  trainingSet <- readRDS(all_dbs[r])
+  
+  # get the samples that need to be classified with that db
+  samples_to_subset <- samdf %>%
+    filter(ref_db == all_dbs[r])
+  
+  # Subset the seqtab to just those samples
+    seqtab_subset <- seqtab_final[str_remove(rownames(seqtab_final), pattern="_S[0-9].*$") %in%
+                                      samples_to_subset$sample_id,]
+  # only keep ASVs (seqtab columns) that are present in those samples (> 0 abundance)
+  seqtab_subset <- seqtab_subset[,colSums(seqtab_subset) > 0]
+  
+  # get the sequences from the subset seqtab
+  dna <- DNAStringSet(getSequences(seqtab_subset)) # Create a DNAStringSet from the ASVs
+  
+  # Classify for that ref_db
+  ids <- IdTaxa(dna, trainingSet, processors=1, threshold = 60, verbose=TRUE, strand = "top") 
+  
+  # Get the filename of that db that we can use to name the output files
+  db_name <- basename(all_dbs[r]) %>% str_remove("_.*$")
+  
+  # Output plot of ids for each db
+	pdf(paste0("output/logs/", db_name,"idtaxa.pdf"), width = 11, height = 8 , paper="a4r")
+	plot(ids)
+	try(dev.off(), silent=TRUE)
+
+  #Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+  tax <- t(sapply(ids, function(x) {
+    taxa <- paste0(x$taxon,"_", x$confidence)
+    taxa[startsWith(taxa, "unclassified_")] <- NA
+    taxa
+  })) %>%
+    purrr::map(unlist) %>%
+    stri_list2matrix(byrow=TRUE, fill=NA) %>%
+    magrittr::set_colnames(ranks) %>%
+    as.data.frame() %>%
+    magrittr::set_rownames(getSequences(seqtab_subset)) %T>%
+	write.csv(paste0("output/logs/", db_name,"idtaxa_results.csv")) %>%  #Write out logfile with confidence levels
+    mutate_all(str_replace,pattern="(?:.(?!_))+$", replacement="") %>%
+    magrittr::set_rownames(getSequences(seqtab_subset)) 
+  
+  # Top hit with BLAST
+  seqs <- taxreturn::char2DNAbin(colnames(seqtab_subset))
+  names(seqs) <- colnames(seqtab_subset)
+  
+  blast_spp <- blast_assign_species(query=seqs,db=blast_dbs[r], identity=97, coverage=95, evalue=1e06,
+                                    max_target_seqs=5, max_hsp=5, ranks=c("Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") , delim=";") %>%
+    dplyr::rename(blast_genus = Genus, blast_spp = Species) %>%
+    dplyr::filter(!is.na(blast_spp))
+  
+  saveRDS(blast_spp, paste0("output/rds/", db_name, "blast.rds"))
+
+  #Join together
+  tax_blast <- tax %>%
+    as_tibble(rownames = "OTU") %>%
+    left_join(blast_spp , by="OTU") %>%
+    mutate(Species = Species %>% str_replace_all("_", " ")) %>%
+    dplyr::mutate(Species = case_when(
+      is.na(Species) & Genus == blast_genus ~ blast_spp,
+      !is.na(Species) ~ Species
+    )) %>%
+    dplyr::select(OTU, ranks) %>%
+    column_to_rownames("OTU") %>%
+    seqateurs::na_to_unclassified() #Propagate high order ranks to unassigned ASVs
+
+  # Write taxonomy table for that db to disk
+  saveRDS(tax_blast, paste0("output/rds/", db_name, "tax.rds"))
+  
+  # Also put the taxonomy table in the list so we dont need to load it in again
+  taxtab_list[[r]] <- tax_blast
+  
+}
+
+# Join the taxtabs back together
+tax_final <- taxtab_list %>% 
+  dplyr::bind_rows() %>%
+  as.matrix()
+
+# Write final taxonomy table to disk
+saveRDS(tax_final, "output/rds/tax.rds") 
+
+
+# Edit assignments
+tax_final <- readRDS("output/rds/tax.rds")
+
+test <- tax_final %>% 
+  as_tibble(rownames="OTU") %>%
+  filter(str_detect(Species, "/")) 
+
+```
+
+# Make phylogenetic tree
+
+In addition to taxonomic assignment, we will create a phylogenetic tree from the identified sequences to allow interpetation within a phylognetic context.
+
+```{r phylogeny}
+seqtab_final <- readRDS("output/rds/seqtab_final.rds")
+
+seqs <- getSequences(seqtab_final)
+names(seqs) <- seqs # This propagates to the tip labels of the tree
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA)
+
+library(phangorn)
+phang.align <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phang.align)
+
+#Fit NJ tree
+treeNJ <- NJ(dm) # Note, tip order != sequence order
+fit <- pml(treeNJ, data=phang.align)
+
+#Fit ML tree
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+                      rearrangement = "stochastic", control = pml.control(trace = 0))
+
+# Write phytree to disk
+saveRDS(fitGTR, "output/rds/phytree.rds") 
+
+#Output newick tree
+write.tree(fitGTR$tree, file="output/results/unfiltered/tree_unfiltered.nwk")
+```
+
+
+# Make Phyloseq object & Output final csvs
+
+Finally, we will merge the sequence table, taxonomy table, phylogenetic tree, and sample data into a single phyloseq object, filter low abundance taxa, and output summary CSV files and fasta files of the identified taxa
+
+```{r create PS, eval = FALSE}
+seqtab_final <- readRDS("output/rds/seqtab_final.rds")
+
+#Extract start of sequence names
+rownames(seqtab_final) <- str_replace(rownames(seqtab_final), pattern="_S[0-9].*$", replacement="")
+
+final_tax <- readRDS("output/rds/tax.rds") 
+phy <- readRDS("output/rds/phytree.rds")$tree
+seqs <- DNAStringSet(colnames(seqtab_final))
+names(seqs) <- seqs
+
+#Load sample information
+samdf <- read.csv("sample_data/Sample_info.csv", header=TRUE) %>%
+  filter(!duplicated(sample_id)) %>%
+  magrittr::set_rownames(.$sample_id) 
+
+# Create phyloseq object
+ps <- phyloseq(tax_table(final_tax),
+               sample_data(samdf),
+               otu_table(seqtab_final, taxa_are_rows = FALSE),
+               #phy_tree(phy),
+               refseq(seqs))
+
+if(nrow(seqtab_final) > nrow(sample_data(ps))){
+  message("Warning: the following samples were not included in phyloseq object, check sample names match the sample metadata")
+  message(rownames(seqtab_final)[!rownames(seqtab_final) %in% sample_names(ps)])
+}
+
+saveRDS(ps, "output/rds/ps.rds") 
+
+#Export raw csv
+speedyseq::psmelt(ps) %>%
+  filter(Abundance > 0) %>%
+  dplyr::select(-Sample) %>%
+  write_csv("output/results/unfiltered/raw_combined.csv")
+  
+#Summary export
+seqateurs::summarise_taxa(ps, "Species", "sample_id") %>%
+  spread(key="sample_id", value="totalRA") %>%
+  write.csv(file = "output/results/unfiltered/spp_sum_unfiltered.csv")
+
+seqateurs::summarise_taxa(ps, "Genus", "sample_id") %>%
+  spread(key="sample_id", value="totalRA") %>%
+  write.csv(file = "output/results/unfiltered/gen_sum_unfiltered.csv")
+
+#Output fasta of all ASV's
+seqateurs::ps_to_fasta(ps, out.file ="output/results/unfiltered/asvs_unfiltered.fasta", seqnames = "Species")
+```
+
+
+# Plot length distributions:
+
+```{r}
+test <- speedyseq::psmelt(ps)%>% 
+  filter(Abundance > 0) %>%
+  mutate(length = nchar(OTU))
+
+
+test  %>%
+  ggplot(aes(x = length)) +
+    geom_histogram() +
+  facet_grid(pcr_primers~.)
+```
+
+# Check taxon names
+
+```{r}
+test2 <- test  %>% 
+  filter(str_detect(Species, "/"))  %>%
+  dplyr::select(OTU, pcr_primers, rank_names(ps)) %>%
+  distinct()
+
+test2 %>% 
+  pull(Species) %>%
+  table()
+
+# On expected will need to merge:
+#mayi/tenuifascias
+#neo / tryoni
+
+# Fix COI
+
+
+
+
+```
+
+
+# Taxon & Sample filtering
+
+Here we will remove all taxa that were not classified to Arthropoda, as these most likely represent residual erroneous sequences. This will be followed by removing all samples which are under a minimum read threshold. In this case, 1000.
+
+```{R taxon filt}
+#Set a threshold for minimum reads per sample
+threshold <- 1000
+
+ps0 <- ps %>%
+  subset_taxa(
+    Phylum == "Arthropoda"
+  ) %>%
+  filter_taxa(function(x) mean(x) > 0, TRUE) %>%
+  prune_samples(sample_sums(.) >0, .) 
+
+#Create rarefaction curve
+
+rare <- otu_table(ps0) %>%
+  as("matrix") %>%
+  rarecurve(step=max(sample_sums(ps0))/100) %>%
+  purrr::map(function(x){
+    b <- as.data.frame(x)
+    b <- data.frame(OTU = b[,1], count = rownames(b))
+    b$count <- as.numeric(gsub("N", "",  b$count))
+    return(b)
+  }) %>%
+  purrr::set_names(sample_names(ps0)) %>%
+  bind_rows(.id="sample_id")
+
+gg.rare <- ggplot(data = rare)+
+  geom_line(aes(x = count, y = OTU, group=sample_id), alpha=0.5)+
+  geom_point(data = rare %>% 
+               group_by(sample_id) %>% 
+               top_n(1, count),
+             aes(x = count, y = OTU, colour=(count > threshold))) +
+  geom_label(data = rare %>% 
+               group_by(sample_id) %>% 
+               top_n(1, count),
+             aes(x = count, y = OTU,label=sample_id, colour=(count > threshold)),
+             hjust=-0.05)+
+  scale_x_continuous(labels =  scales::scientific_format()) +
+  geom_vline(xintercept=threshold, linetype="dashed") +
+  labs(colour = "Sample kept?") +
+  xlab("Sequence reads") +
+  ylab("Observed ASV's")
+
+gg.rare
+
+#Write out figure
+pdf(file="fig/rarefaction.pdf", width = 11, height = 8 , paper="a4r")
+  plot(gg.rare)
+try(dev.off(), silent=TRUE)
+
+#Remove all samples under the minimum read threshold 
+ps1 <- ps0 %>%
+  prune_samples(sample_sums(.)>=threshold, .) %>% 
+  filter_taxa(function(x) mean(x) > 0, TRUE) #Drop missing taxa from table
+
+#Message how many were removed
+message(nsamples(ps) - nsamples(ps1), " Samples and ", ntaxa(ps) - ntaxa(ps1), " ASVs dropped")
+
+# Export summary of filtered results
+seqateurs::summarise_taxa(ps1, "Species", "sample_id") %>%
+  spread(key="sample_id", value="totalRA") %>%
+  write.csv(file = "output/results/filtered/spp_sum_filtered.csv")
+
+seqateurs::summarise_taxa(ps1, "Genus", "sample_id") %>%
+  spread(key="sample_id", value="totalRA") %>%
+  write.csv(file = "output/results/filtered/gen_sum_filtered.csv")
+
+#Output fasta of all ASV's
+seqateurs::ps_to_fasta(ps1, "output/results/filtered/asvs_filtered.fasta", seqnames="Species")
+
+#Output newick tree
+write.tree(phy_tree(ps1), file="output/results/filtered/tree_filtered.nwk")
+
+# output filtered phyloseq object
+saveRDS(ps1, "output/rds/ps_filtered.rds") 
+```
+
+
+# Output final CSVs
+We will output the final 3 filtered CSVs which will be uploaded to the imappests staging point database
+
+* seqtab.csv
+* taxtab.csv
+* samdf.csv
+
+```{R output csvs}
+seqtab <- otu_table(ps1) %>%
+  as("matrix") %>%
+  as_tibble(rownames = "sample_id")
+
+taxtab <- tax_table(ps1) %>%
+  as("matrix") %>%
+  as_tibble(rownames = "OTU") %>%
+  unclassified_to_na(rownames = FALSE)
+
+#Check taxonomy table outputs
+if(!all(colnames(taxtab) == c("OTU", "Root", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))){
+  message("Warning: Taxonomy table columns do not meet expectations for the staging database \n
+          Database requires the columns: OTU, Root, Kingdom, Phylum, Class, Order, Family, Genus, Species ")
+}
+
+if(any(str_detect(taxtab$Species, "/"))){
+  message("Warning: Taxonomy table contains taxa with clashes at the species level, these should be corrected before upload:")
+  clashes <- taxtab$Species[str_detect(taxtab$Species, "/")]
+  print(clashes[!is.na(clashes)])
+}
+
+samdf <- sample_data(ps1) %>%
+  as("matrix") %>%
+  as_tibble()
+
+# Write out
+write_csv(seqtab, "output/results/final/seqtab.csv")
+write_csv(taxtab, "output/results/final/taxtab.csv")
+write_csv(samdf, "output/results/final/samdf.csv")
+
+#Write out combined
+speedyseq::psmelt(ps1) %>%
+  filter(Abundance > 0) %>%
+  dplyr::select(-Sample) %>%
+  write_csv("output/results/filtered/combined.csv")
+```
+
+
+# Optional - Check presence of taxa in Australia
+
+This is an optional step to run an automated search against the Australian Faunal Directory ato see if the the detected species have been recorded in Australia before.
+
+Press the CODE button to the lower right to display the code for this optional step.
+
+```{r distribution check, class.source = 'fold-hide'}
+ps1 <- readRDS("output/rds/ps_filtered.rds")
+
+# Check presence on AFD
+afd_check <- ps1 %>%
+  speedyseq::psmelt() %>%
+  dplyr::group_by(Family, Genus, Species) %>%
+  summarise(metabarcoding_reads = sum(Abundance)) %>%
+  filter(!str_detect(Species, "__")) %>%
+  mutate(Species = Species %>% str_replace_all("_", " ")) %>%
+  mutate(
+    Family_present = afdscraper::check_afd_presence(Family),
+    Genus_present = afdscraper::check_afd_presence(Genus),
+    Species_present = afdscraper::check_afd_presence(Species)
+  ) %>%
+  dplyr::select(Family, Family_present, Genus, Genus_present, 
+                Species, Species_present, metabarcoding_reads)
+    
+write_csv(afd_check, "output/results/final/afd_check.csv")
+
+# Check presence on ALA
+# First we need to set some data quality filters for ALA
+# To view available filters, run: find_field_values("basis_of_record")
+ala_quality_filter <- galah::select_filters(
+      basisOfRecord = c("PreservedSpecimen", "LivingSpecimen",
+                      "MaterialSample", "NomenclaturalChecklist"),
+      profile = "ALA")
+
+ala_quality_filter <- galah::select_filters(
+      profile = "ALA")
+
+ala_check <- ps1 %>%
+  speedyseq::psmelt() %>%
+  dplyr::group_by(Family, Genus, Species) %>%
+  summarise(metabarcoding_reads = sum(Abundance)) %>%
+  filter(!str_detect(Species, "__")) %>%
+  mutate(Species = Species %>% str_replace_all("_", " ")) %>%
+  mutate(
+    species_present = purrr::map(Species, function(x){
+    # first check name
+    query <- select_taxa(x) %>% 
+      as_tibble()%>%
+      dplyr::filter(across(any_of("match_type"), ~!.x == "higherMatch"))
+    # Then get occurance counts
+    if(!is.null(query$scientific_name)){
+      ala_occur <- ala_counts(taxa=query, filters=ala_quality_filter)
+      return(data.frame(Species_present = ifelse(ala_occur > 0, TRUE, FALSE), ALA_counts = ala_occur))
+    } else {
+      return(data.frame(Species_present = FALSE, ALA_counts = 0))
+    }
+    })) %>%
+  unnest(species_present) %>%
+  dplyr::select(Family, Genus, Species, Species_present, ALA_counts, metabarcoding_reads)
+
+write_csv(ala_check, "output/results/final/ala_check.csv")
+```
+
+# Output fate of reads through pipeline
+
+```{r readtracker}
+#Fraction of reads assigned to each taxonomic rank
+sum_reads <- speedyseq::psmelt(ps) %>%
+  gather("Rank","Name", rank_names(ps)) %>%
+  group_by(Rank, sample_id) %>% 
+  mutate(Name = replace(Name, str_detect(Name, "__"),NA)) %>% # This line turns the "__" we added to lower ranks back to NA's
+  summarise(Reads_classified = sum(Abundance * !is.na(Name))) %>% 
+  pivot_wider(names_from = "Rank",
+              values_from = "Reads_classified") %>%
+  dplyr::select(sample_id, rank_names(ps)) %>%
+  dplyr::rename_at(rank_names(ps), ~paste0("reads_", .))
+
+#Update log DF
+logdf <- read_csv("output/logs/logdf.csv")
+
+logdf <- logdf %>% 
+  left_join(sum_reads,
+  by=c("sample_id"))
+
+write_csv(logdf, "output/logs/logdf.csv")
+
+
+gg.all_reads <- logdf %>%
+  dplyr::select(sample_id, fcid, starts_with("reads_"), -reads_total, -reads_pf) %>%
+  pivot_longer(starts_with("reads_"),
+               names_to = "type",
+               values_to = "value") %>%
+  group_by(fcid, type) %>% 
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  bind_rows(logdf %>%
+  dplyr::select(fcid, reads_total, reads_pf) %>%
+    distinct()%>%
+  pivot_longer(starts_with("reads_"),
+               names_to = "type",
+               values_to = "value")
+  ) %>%
+  mutate(type = str_remove(type, "reads_")) %>%
+  mutate(type = factor(type, levels = c(
+  "total", "pf", "demulti",
+  "trimmed", "qualfilt",
+  "denoised", "merged",
+  "chimerafilt", "sizefilt", "codonfilt",
+  "Root", "Kingdom", "Phylum",
+  "Class", "Order","Family",
+  "Genus", "Species"))) %>% 
+  ggplot(aes(x=type, y=value, fill=fcid)) +
+  geom_bar(stat="identity") +
+  facet_wrap(~fcid) +
+  theme(axis.text.x = element_text(angle=90, hjust = 1, vjust=0.5)) 
+
+gg.all_reads
+
+pdf(paste0("output/logs/read_tracker_all.pdf"), width = 11, height = 8 , paper="a4r")
+  gg.all_reads
+try(dev.off(), silent=TRUE)
+  
+# Read tracker per sample
+  
+gg.separate_reads <- logdf %>%
+  dplyr::select(sample_id, fcid, starts_with("reads_"), -reads_total, -reads_pf) %>%
+  pivot_longer(starts_with("reads_"),
+               names_to = "type",
+               values_to = "value") %>%
+  mutate(type = str_remove(type, "reads_")) %>%
+  mutate(type = factor(type, levels = c(
+  "total", "pf", "demulti",
+  "trimmed", "qualfilt",
+  "denoised", "merged",
+  "chimerafilt", "sizefilt", "codonfilt",
+  "Root", "Kingdom", "Phylum",
+  "Class", "Order","Family",
+  "Genus", "Species"))) %>% 
+  ggplot(aes(x=type, y=value, fill=fcid)) +
+  geom_bar(stat="identity") +
+  facet_wrap(~sample_id) +
+  theme(axis.text.x = element_text(angle=90, hjust = 1, vjust=0.5)) 
+
+gg.separate_reads
+
+pdf(paste0("output/logs/read_tracker_separate.pdf"), width = 11, height = 8 , paper="a4r")
+  gg.separate_reads
+try(dev.off(), silent=TRUE)
+```
+
+# Further analysis
+
+From here, the dataset can be further analysed in software of your choice. I suggest the use of [phyloseq](https://joey711.github.io/phyloseq/) 
+

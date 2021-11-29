@@ -29,6 +29,7 @@ module load GDAL/3.0.2-foss-2019a-Python-3.7.2
                     "ShortRead",
                     "furrr",
                     "future",
+                    "ggradar",
                     "TmCalculator",
                     "castor",
                     "phangorn",
@@ -236,7 +237,7 @@ alignments_cleaned %>%
 ```{r filter seqs}
 # flag clusters with mixed taxonomy at different cluster thresholds and taxonomic ranks
 db <- taxreturn::get_ncbi_taxonomy()
-ncores <- 10
+ncores <- 3
 set.seed(666)
 
 #x <- fs::dir_ls(path="diagnostic_alignments/merged", glob = "*.fa.gz*")[[1]]
@@ -249,32 +250,32 @@ filt <- fs::dir_ls(path="diagnostic_alignments/merged", glob = "*.fa.gz")%>%
       str_remove("_.*$")
     
     seqs <- insect::readFASTA(x)
+    names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
     #seqs <- seqs[1:100]
 
     # Remove any duplicated sequence accessions
     uniqSeqs <- seqs[!duplicated(str_remove(names(seqs), "\\|.*$"))]
     
     # Resolve taxonomic synonyms
-    resolved <- resolve_synonyms_ncbi(uniqSeqs )
+    resolved <- resolve_synonyms_ncbi(uniqSeqs)
     
     #Check names difference
     #names(uniqSeqs)[which(!names(uniqSeqs) %in% names(resolved))]
     #names(resolved)[which(!names(resolved) %in% names(uniqSeqs))]
     
     # Filter sequeunces with bad names
-    seqnames <- names(resolved) %>% str_remove("^.*;")
-    names(resolved)[str_detect(seqnames, "sp\\.|spp\\.|aff\\.|nr\\.|bv\\.|cf\\.|nom\\.|nud\\.|environment|undescribed|unverified|unclassified|uncultured|unidentif|[0-9]|[:punct:]")] <- NA
-    namefilt <- resolved[!is.na(names(resolved))]
+    names_to_remove <- str_detect(names(resolved) %>% str_remove("^.*;") %>% str_replace("_", " "), "sp\\.|spp\\.|aff\\.|nr\\.|bv\\.|cf\\.|nom\\.|nud\\.|environment|undescribed|unverified|unclassified|uncultured|unidentif|[0-9]|[:punct:]")
+    namefilt <- resolved[!names_to_remove]
     
     # Filter out putatively mislabelled seqs
-    resolved <- resolved[!names(resolved) %in% to_remove]
+    misannot <- namefilt[!names(namefilt) %in% to_remove]
     
     #load phmm
     model <- readRDS(fs::dir_ls(path="diagnostic_alignments/model", glob = paste0("*",loci_name,"*")))
     
     # Align to phmm
     #ifelse(loci_name == "COI", TRUE, FALSE)
-    filtered <- taxreturn::map_to_model(namefilt,  model, min_score = 100,
+    filtered <- taxreturn::map_to_model(misannot,  model, min_score = 100,
      shave=TRUE, trim_ends = 4, check_frame=TRUE,  max_N = 5, max_gap=(model$size/3), extra="drop", kmer_threshold = 0.3, k = 5,
      multithread=ncores, quiet=FALSE, progress = FALSE)
     
@@ -285,31 +286,82 @@ filt <- fs::dir_ls(path="diagnostic_alignments/merged", glob = "*.fa.gz")%>%
     mixed_clusters <- taxreturn::get_mixed_clusters(codonfilt, db, rank="species", threshold=0.99, return="consensus", confidence=0.8, quiet=FALSE)
     purged  <- subset.DNAbin(codonfilt, subset = !str_replace(names(codonfilt), "(?:.(?!;))+$", "") %in% mixed_clusters$Acc)
  
-    # prune overrepresented groups
-    pruned <- taxreturn::prune_groups(purged, max_group_size = 5, discardby = "length", dedup = TRUE, quiet = FALSE)
-	
+    # prune overrepresented groups - prefering inhouse sequences in case of ties
+    prefered_taxa <- fs::dir_ls("diagnostic_alignments/inhouse", glob=paste0("*",loci_name,"*")) %>%
+      map(function(x){
+        names(insect::readFASTA(x))
+      })%>%
+      unlist() %>%
+      unname()
+
+    pruned <- prune_groups2(purged, max_group_size = 5, discardby = "length", dedup = TRUE, prefer=prefered_taxa, quiet = FALSE)
+    
 	  #Write out results filtered results
     insect::writeFASTA(pruned, file=paste0("diagnostic_alignments/cleaned/", loci_name, ".fa.gz"), compress=TRUE)
 
-    # Return number of filtered sequences
-    out <- tibble(
-      loci = loci_name,
-      seqs = length(seqs),
-      uniqseqs = length(uniqSeqs),
-      namefilt = length(namefilt),
-      phmm = length(filtered),
-      codonfilt = length(codonfilt),
-      purged = length(purged),
-      pruned = length(pruned)
-      
-    )
-    return(out)
+    
+    #Trace each sequence through filtering
+    seq_tracker <- tibble::enframe(names(seqs), name=NULL, value="seq") %>%
+      tidyr::separate(seq, into=c("acc", "tax_id", "species"), sep = "\\||;") %>%
+      mutate(uniqseqs = case_when(
+        acc %in% (names(uniqSeqs) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(uniqSeqs) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      namefilt = case_when(
+        acc %in% (names(namefilt) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(namefilt) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      misannot = case_when(
+        acc %in% (names(misannot) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(misannot) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      phmm = case_when(
+        acc %in% (names(filtered) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(filtered) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      codonfilt = case_when(
+        acc %in% (names(codonfilt) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(codonfilt) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      purged = case_when(
+        acc %in% (names(purged) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(purged) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      pruned = case_when(
+        acc %in% (names(pruned) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(pruned) %>% str_remove("\\|.*$")) ~ FALSE
+      ), loci = loci_name)
+    #
+    #out <- tibble(
+    #  loci = loci_name,
+    #  seqs = length(seqs),
+    #  uniqseqs = length(uniqSeqs),
+    #  namefilt = length(namefilt),
+    #  phmm = length(filtered),
+    #  codonfilt = length(codonfilt),
+    #  purged = length(purged),
+    #  pruned = length(pruned)
+    #  
+    #)
+    return(seq_tracker)
 })%>%
   bind_rows()
 
-write_csv(filt, "filter_stats.csv")
+
+#write_csv(filt, "filter_stats.csv")
+
+
+target_list <- readxl::read_xlsx("sample_data/180613 _ALL FF_Lucid Key_NAQS flies.xlsx") %>%
+  janitor::clean_names() %>%
+  dplyr::select(lure = trap_lure_type, genus, species) %>%
+  mutate(species = paste0(genus, " ", species))
 
 filt <- read_csv("filter_stats.csv")
+
+
+target_list %>% 
+  left_join(filt)
+
 
 filt %>%
   pivot_longer(-loci,
@@ -708,7 +760,7 @@ id_success <- fs::dir_ls(path="diagnostic_alignments/amplicons/", glob = "*.fa*"
   
   loci_name <- basename(as.character(x)) %>% str_remove(".fa.gz")
 
-  dataset <- c("all","dacine", "target", "me", "cue") #
+  dataset <- c("all","dacine", "target") #"me", "cue"
   res <- vector("list", length=length(dataset))
   for (d in 1:length(dataset)){
     print(dataset[d])
@@ -842,7 +894,7 @@ id_combinations <- id_success %>%
     str_detect(bcm,"/") ~ "mixed",
     TRUE ~ bcm
   )) %>%
-  ungroup() # %>%
+  ungroup()  %>%
   tidyr::complete(loci, spp, fill=list(mono=NA, nn=NA, bcm=NA))%>%
   mutate(genus = spp %>% str_remove(" .*$"))
 
@@ -1258,8 +1310,8 @@ mismatch <- fs::dir_ls(path="diagnostic_alignments/cleaned/", glob = "*.fa*") %>
 
 # all
 mismatch %>%
-  mutate(genus = template %>% str_remove("^.*;") %>%
-           str_remove(" .*$")) %>%
+  mutate(genus = template_name %>% str_remove("^.*;") %>%
+           str_remove("_.*$")) %>%
   group_by(genus, loci, primer, direction) %>%
   summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
   ungroup() %>%
@@ -1271,9 +1323,9 @@ mismatch %>%
 
 # Dacinae
 mismatch %>%
-  mutate(genus = template %>% str_remove("^.*;") %>%
-           str_remove(" .*$"),
-         species = template %>% str_remove("^.*;")) %>%
+  mutate(genus = template_name %>% str_remove("^.*;") %>%
+           str_remove("_.*$"),
+         species = template_name %>% str_remove("^.*;")) %>%
   group_by(species,genus, loci, primer, direction) %>%
   summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
   ungroup() %>%
@@ -1299,9 +1351,9 @@ target_list <- readxl::read_xlsx("sample_data/180613 _ALL FF_Lucid Key_NAQS flie
 
 # Targets heatmap
 mismatch %>%
-  mutate(genus = template %>% str_remove("^.*;") %>%
-           str_remove(" .*$"),
-         species = template %>% str_remove("^.*;")) %>%
+  mutate(genus = template_name %>% str_remove("^.*;") %>%
+           str_remove("_.*$"),
+         species = template_name %>% str_remove("^.*;")) %>%
   group_by(species,genus, loci, primer, direction) %>%
   summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
   ungroup() %>%
@@ -1310,7 +1362,7 @@ mismatch %>%
   ungroup() %>%
   mutate(primer = reorder_within(primer, mean_mm, direction)) %>%
   filter(!is.na(mismatch)) %>%
-  filter(species %in% target_list$species) %>%
+  filter(species %in% (target_list$species %>% str_replace_all(" ", "_"))) %>%
   ggplot(aes(x = primer, y = species, fill=mismatch)) +
   geom_tile() +
   facet_grid(~direction, drop = TRUE, scales="free_x") +
@@ -1322,11 +1374,12 @@ mismatch %>%
        y = "Target species",
        fill = "Mismatch \npenalty")
 
+library(ggradar)
 
 gg.radar_f <- mismatch %>%
-  mutate(genus = template %>% str_remove("^.*;") %>%
-           str_remove(" .*$"),
-         species = template %>% str_remove("^.*;")) %>%
+  mutate(genus = template_name %>% str_remove("^.*;") %>%
+           str_remove("_.*$"),
+         species = template_name %>% str_remove("^.*;")) %>%
   filter(direction == "F") %>%
   filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
   group_by(genus, primer) %>%
@@ -1339,9 +1392,9 @@ gg.radar_f <- mismatch %>%
   ggradar() 
 
 gg.radar_r <- mismatch %>%
-  mutate(genus = template %>% str_remove("^.*;") %>%
-           str_remove(" .*$"),
-         species = template %>% str_remove("^.*;")) %>%
+  mutate(genus = template_name %>% str_remove("^.*;") %>%
+           str_remove("_.*$"),
+         species = template_name %>% str_remove("^.*;")) %>%
   filter(direction == "R") %>%
   filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
   group_by(genus, primer) %>%
@@ -1360,143 +1413,13 @@ gg.radar_f / gg.radar_r
 
 # Impute missing
 
-Compare imputign scores from tree, vs imputing sequences then calculating scores
-
-Steps:
-- get known outcomes by filtering to only complete sequences and calculating scores
-- Randomly Drop out the entire binding positions (or part of binding positions) for a subset of known sequences (10%?)
-- Impute sequence data then calculate scores OR calculate scores then impute scores
-- Compare RMSE between the known and imptued data
-
-
-```{r}
-
-seqs <- insect::readFASTA("diagnostic_alignments/cleaned/COI.fa.gz")
-
-# Make full distance matrix
-datd <- DECIPHER::DistanceMatrix(DNAbin2DNAstringset(seqs), includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
-                                 penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor", processors = 1, verbose = TRUE)
-
-tree <- bionjs(datd)
-
-# Get binding position of primers
-model <- readRDS("diagnostic_alignments/model/Bactrocera_COI.rds")
-
-primers <- read_csv("primer_candidates.csv")%>%
-  dplyr::filter(loci == loci_name)%>% 
-  select(loci, name = Fname, primer=Fseq) %>%
-  left_join(.$primer %>% purrr::map(get_binding_position, model, tryrc = FALSE, min_score=8) %>%
-          bind_rows()) %>%
-  mutate(dir="F") %>%
-  bind_rows( read_csv("primer_candidates.csv")%>%
-  dplyr::filter(loci == loci_name)%>% 
-  select(loci, name = Rname, primer=Rseq) %>%
-  left_join(.$primer %>% purrr::map(get_binding_position, model, tryrc = TRUE, min_score=8) %>%
-          bind_rows()) %>%
-  mutate(dir="R")
-  ) 
-    
-set.seed(666)
-mismatch_rmse <- vector("list", length=nrow(primers))
-for (p in 1:nrow(primers)){
-
-  # Calculate the mismatch for the full known seqs
-  known_mismatch <- evaluate_primer(seqs, primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
-                             direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "skip", ambig = "skip",
-                             adjacent = 2, quiet=FALSE) %>%
-   mutate(primer = primers$name[p], primer_seq = primers$primer[p])
-  
-  # Delete a random 10% within the binding regions
-  to_delete <- sample(seq(1, length(seqs),1), round(length(seqs)/5), replace = FALSE)
-  eval_seqs <- as.matrix(seqs)
-  eval_seqs[to_delete, primers$start[p]:primers$end[p]] <- as.raw(00)
-  
-  # Calculate the mismatch for the full known seqs
-  imputed_mismatch <- evaluate_primer(as.list(eval_seqs), primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
-                             direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "impute", ambig = "impute",
-                             adjacent = 2, quiet=FALSE, tree=tree) %>%
-   mutate(primer = primers$name[p], primer_seq = primers$primer[p]) 
-  
-  # Calculate RMSE for just the imputed ones
-  eval_mismatch <- known_mismatch[to_delete,] %>%
-    dplyr::select(template_name, known_seq = template_seq, known_mm = sum, primer) %>%
-    left_join(imputed_mismatch[to_delete,]%>%
-    dplyr::select(template_name, imputed_seq = template_seq, impute_mm = sum, primer)) 
-  
-  eval_rmse1 <- eval_mismatch %>%
-    rmse(truth = known_mm, estimate=impute_mm) %>%
-    dplyr::select(rmse1 = .estimate)
-  
-  
-  # Alternatively - Impute the mismatch scores rather than the sequence
-  unimputed_mismatch <- evaluate_primer(as.list(eval_seqs), primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
-                             direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "skip", ambig = "skip",
-                             adjacent = 2, quiet=FALSE, tree=tree) %>%
-   mutate(primer = primers$name[p], primer_seq = primers$primer[p]) 
-  
-  # Impute mismatch score 
-  
-  #Get subtree of only genera
-  pruned_tree  <- castor::get_subtree_with_tips(tree,
-                                            only_tips = names(eval_seqs),
-                                            collapse_monofurcations=TRUE,
-                                            force_keep_root=TRUE)$subtree
-  
-  Ntips 	<- length(pruned_tree$tip.label)
-  Nnodes 	<- pruned_tree$Nnode
-
-  # create internal node labels
-  pruned_tree$node.label <- NA
-  if(is.na(pruned_tree$node.label)){
-  	pruned_tree$node.label = paste("node.", 1:Nnodes, sep = "") # don't use underscores, because some tree readers (e.g. rncl) interpret them as spaces
-  }
-  # replace zero-length edges
-  if(any(pruned_tree$edge.length==0)){
-    epsilon = 0.1*min(pruned_tree$edge.length[pruned_tree$edge.length>0])
-  	pruned_tree$edge.length[pruned_tree$edge.length==0] = epsilon
-  }
-    
-  tip_states <- unimputed_mismatch %>%
-    column_to_rownames("template_name") %>%
-    dplyr::select(values  = sum)
-    
-  row2tip <- match(rownames(tip_states), pruned_tree$tip.label)
-  
-  tip_states <- tip_states[!is.na(row2tip),,drop = FALSE]
-  hsp_states <- castor::hsp_independent_contrasts(tree = pruned_tree,
-                                              tip_states = tip_states$values,
-                                              weighted = FALSE,
-                                              check_input = TRUE)$states
-  imputed_states <- tip_states %>%
-    mutate(impute_mm = hsp_states[1:Ntips])
-  
-  eval_mismatch2 <- known_mismatch[to_delete,] %>%
-    dplyr::select(template_name, known_seq = template_seq, known_mm = sum, primer) %>%
-    left_join(imputed_states[to_delete,]%>%
-                rownames_to_column("template_name") %>%
-    dplyr::select(template_name,impute_mm)) 
-  
-  eval_rmse2 <- eval_mismatch2 %>%
-    rmse(truth = known_mm, estimate=impute_mm) %>%
-    dplyr::select(rmse2 = .estimate)
-  
-  mismatch_rmse[[p]] <- bind_cols(eval_rmse1, eval_rmse2)
-  
-  # Imputing states seems to be more accurate?
-  
-  # Evaluate different imputing algorithms?
-  
-  # Do the resamples in phylogenetic distance bins?
-  
-}
-
-
+```{r imputation}
 # Arrange on tree
 tree <- readRDS("output/rds/supertree.rds")
 
 # Filter summaries to just those in tree
 mismatch_summaries <- mismatch %>% 
-  mutate(species = template %>% str_remove("^.*;")) %>%
+  mutate(species = template_name %>% str_remove("^.*;") %>% str_replace_all("_", " ")) %>%
   dplyr::filter(species %in% (tree$tip.label)) %>%
   group_by(species, primer, direction) %>%
   summarise(values = mean(sum, na.rm=TRUE))
@@ -1588,30 +1511,526 @@ gg.radar_imputed_f <- imputed %>%
   mutate_at(vars(-primer), function(x) {1-scales::rescale(x)}) %>%
   ggradar() 
 
-gg.radar_r <- mismatch %>%
-  mutate(genus = template %>% str_remove("^.*;") %>%
-           str_remove(" .*$"),
-         species = template %>% str_remove("^.*;")) %>%
+gg.radar_imputed_r <- imputed %>%
+  mutate(genus = species  %>%
+           str_remove(" .*$")) %>%
   filter(direction == "R") %>%
   filter(genus %in% c("Bactrocera", "Dacus", "Zeugodacus", "Monacrostichus")) %>%
   group_by(genus, primer) %>%
-  summarise(mismatch = mean(sum, na.rm=TRUE)) %>%
+  summarise(mismatch = mean(hsp, na.rm=TRUE)) %>%
   ungroup() %>%
   pivot_wider(names_from = genus,
               values_from = mismatch,
               values_fill=list(mismatch=0))%>%
   mutate_at(vars(-primer), function(x) {1-scales::rescale(x)}) %>%
-  ggradar() +
-  scale_color_brewer(palette="Set1")
+  ggradar() 
 
-gg.radar_f / gg.radar_r
+gg.radar_imputed_f / gg.radar_imputed_r
+
+
+pdf(file= "fig/imputed_mismatch_radar.pdf", width = 11, height = 8, paper="a4r")
+  plot(gg.radar_imputed_f)
+  plot(gg.radar_imputed_r)
+try(dev.off(), silent=TRUE)
+  
+```
+
+# Compare imputation
+Compare imputign scores from tree, vs imputing sequences then calculating scores
+
+Steps:
+- get known outcomes by filtering to only complete sequences and calculating scores
+- Randomly Drop out the entire binding positions (or part of binding positions) for a subset of known sequences (10%?)
+- Impute sequence data then calculate scores OR calculate scores then impute scores
+- Compare RMSE between the known and imptued data
+
+
+```{r}
+
+seqs <- insect::readFASTA("diagnostic_alignments/cleaned/COI.fa.gz")
+
+# Make full distance matrix
+datd <- DECIPHER::DistanceMatrix(DNAbin2DNAstringset(seqs), includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
+                                 penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor", processors = 1, verbose = TRUE)
+
+tree <- bionjs(datd)
+
+# Get binding position of primers
+model <- readRDS("diagnostic_alignments/model/Bactrocera_COI.rds")
+
+primers <- read_csv("primer_candidates.csv")%>%
+  dplyr::filter(loci == loci_name)%>% 
+  select(loci, name = Fname, primer=Fseq) %>%
+  left_join(.$primer %>% purrr::map(get_binding_position, model, tryrc = FALSE, min_score=8) %>%
+          bind_rows()) %>%
+  mutate(dir="F") %>%
+  bind_rows( read_csv("primer_candidates.csv")%>%
+  dplyr::filter(loci == loci_name)%>% 
+  select(loci, name = Rname, primer=Rseq) %>%
+  left_join(.$primer %>% purrr::map(get_binding_position, model, tryrc = TRUE, min_score=8) %>%
+          bind_rows()) %>%
+  mutate(dir="R")
+  ) 
+    
+set.seed(666)
+mismatch_rmse <- vector("list", length=nrow(primers))
+for (p in 1:nrow(primers)){
+
+  # Calculate the mismatch for the full known seqs
+  known_mismatch <- evaluate_primer(seqs, primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
+                             direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "skip", ambig = "skip",
+                             adjacent = 2, quiet=FALSE) %>%
+   mutate(primer = primers$name[p], primer_seq = primers$primer[p])
+  
+  # Delete a random 10% within the binding regions
+  to_delete <- sample(seq(1, length(seqs),1), round(length(seqs)/2), replace = FALSE)
+  eval_seqs <- as.matrix(seqs)
+  eval_seqs[to_delete, primers$start[p]:primers$end[p]] <- as.raw(00)
+  
+  # Calculate the mismatch for the full known seqs
+  imputed_mismatch <- evaluate_primer(as.list(eval_seqs), primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
+                             direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "impute", ambig = "impute",
+                             adjacent = 2, quiet=FALSE, tree=tree) %>%
+   mutate(primer = primers$name[p], primer_seq = primers$primer[p]) 
+  
+  # Calculate RMSE for just the imputed ones
+  eval_mismatch <- known_mismatch[to_delete,] %>%
+    dplyr::select(template_name, known_seq = template_seq, known_mm = sum, primer) %>%
+    left_join(imputed_mismatch[to_delete,]%>%
+    dplyr::select(template_name, imputed_seq = template_seq, impute_mm = sum, primer)) 
+  
+  eval_rmse1 <- eval_mismatch %>%
+    rmse(truth = known_mm, estimate=impute_mm) %>%
+    dplyr::select(rmse1 = .estimate)
+  
+  
+  # Alternatively - Impute the mismatch scores rather than the sequence
+  unimputed_mismatch <- evaluate_primer(as.list(eval_seqs), primer = primers$primer[p], positions = c(primers$start[p], primers$end[p]),
+                             direction = ifelse(primers$dir[p] == "F", "F", "R"), gaps = "skip", ambig = "skip",
+                             adjacent = 2, quiet=FALSE, tree=tree) %>%
+   mutate(primer = primers$name[p], primer_seq = primers$primer[p]) 
+  
+  # Impute mismatch score 
+  
+  #Get subtree of only genera
+  pruned_tree  <- castor::get_subtree_with_tips(tree,
+                                            only_tips = names(eval_seqs),
+                                            collapse_monofurcations=TRUE,
+                                            force_keep_root=TRUE)$subtree
+  
+  Ntips 	<- length(pruned_tree$tip.label)
+  Nnodes 	<- pruned_tree$Nnode
+
+  # create internal node labels
+  pruned_tree$node.label <- NA
+  if(is.na(pruned_tree$node.label)){
+  	pruned_tree$node.label = paste("node.", 1:Nnodes, sep = "") # don't use underscores, because some tree readers (e.g. rncl) interpret them as spaces
+  }
+  # replace zero-length edges
+  if(any(pruned_tree$edge.length==0)){
+    epsilon = 0.1*min(pruned_tree$edge.length[pruned_tree$edge.length>0])
+  	pruned_tree$edge.length[pruned_tree$edge.length==0] = epsilon
+  }
+    
+  tip_states <- unimputed_mismatch %>%
+    column_to_rownames("template_name") %>%
+    dplyr::select(values  = sum)
+    
+  row2tip <- match(rownames(tip_states), pruned_tree$tip.label)
+  
+  tip_states <- tip_states[!is.na(row2tip),,drop = FALSE]
+  hsp_states <- castor::hsp_independent_contrasts(tree = pruned_tree,
+                                              tip_states = tip_states$values,
+                                              weighted = FALSE,
+                                              check_input = TRUE)$states
+  imputed_states <- tip_states %>%
+    mutate(impute_mm = hsp_states[1:Ntips])
+  
+  eval_mismatch2 <- known_mismatch[to_delete,] %>%
+    dplyr::select(template_name, known_seq = template_seq, known_mm = sum, primer) %>%
+    left_join(imputed_states[to_delete,]%>%
+                rownames_to_column("template_name") %>%
+    dplyr::select(template_name,impute_mm)) 
+  
+  eval_rmse2 <- eval_mismatch2 %>%
+    rmse(truth = known_mm, estimate=impute_mm) %>%
+    dplyr::select(rmse2 = .estimate)
+  
+  mismatch_rmse[[p]] <- bind_cols(eval_rmse1, eval_rmse2)
+  
+  # Imputing states seems to be more accurate?
+  
+  # Evaluate different imputing algorithms?
+  
+  # Do the resamples in phylogenetic distance bins?
+  
+}
+
 
 
 ```
 
 
 
+# Create reference databases 
 
+```{r filter seqs}
+# flag clusters with mixed taxonomy at different cluster thresholds and taxonomic ranks
+db <- taxreturn::get_ncbi_taxonomy()
+ncores <- 3
+set.seed(666)
+
+#x <- fs::dir_ls(path="diagnostic_alignments/merged", glob = "*.fa.gz*")[[1]]
+to_remove <- readLines("diagnostic_alignments/mislabelled.txt")
+
+dir.create("diagnostic_alignments/reference")
+
+filt <- c("diagnostic_alignments/merged/COI_merged.fa.gz",
+          "diagnostic_alignments/merged/EIF3L_merged.fa.gz") %>%
+  purrr::map(function(x){
+    loci_name <- basename(as.character(x)) %>% 
+      str_remove("_.*$")
+    
+    seqs <- insect::readFASTA(x)
+    names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
+    #seqs <- seqs[1:100]
+
+    # Remove any duplicated sequence accessions
+    uniqSeqs <- seqs[!duplicated(str_remove(names(seqs), "\\|.*$"))]
+    
+    # Resolve taxonomic synonyms
+    resolved <- resolve_synonyms_ncbi(uniqSeqs)
+    
+    #Check names difference
+    #names(uniqSeqs)[which(!names(uniqSeqs) %in% names(resolved))]
+    #names(resolved)[which(!names(resolved) %in% names(uniqSeqs))]
+    
+    # Filter sequeunces with bad names
+    #names_to_remove <- str_detect(names(resolved) %>% str_remove("^.*;") %>% str_replace("_", " "), "sp\\.|spp\\.|aff\\.|nr\\.|bv\\.|cf\\.|nom\\.|nud\\.|environment|undescribed|unverified|unclassified|uncultured|unidentif|[0-9]|[:punct:]")
+    #namefilt <- resolved[!names_to_remove]
+    
+    # Filter out putatively mislabelled seqs
+    misannot <- resolved[!names(resolved) %in% to_remove]
+    
+    #load phmm
+    model <- readRDS(fs::dir_ls(path="diagnostic_alignments/model", glob = paste0("*",loci_name,"*")))
+    
+    # Trim model to primers
+    if(loci_name == "COI"){
+      model <- subset_model(model, primers = c("GGDACWGGWTGAACWGTWTAYCCHCC", "GTRATWGCHCCDGCTARWACWGG"), trimprimers = TRUE)
+    } else if (loci_name == "EIF3L"){
+      model <- subset_model(model, primers = c("GATGCGYCGTTATGCYGATGC", "TTRAAYACTTCYARATCRCC"), trimprimers = TRUE)
+    }
+    
+    # Align to phmm
+    filtered <- taxreturn::map_to_model(resolved,  model, min_score = 100,
+     shave=TRUE, trim_ends = 4, check_frame=TRUE,  max_N = 5, max_gap=(model$size/3), extra="drop", kmer_threshold = 0.3, k = 5,
+     multithread=ncores, quiet=FALSE, progress = FALSE)
+    
+    # Check for stop codons
+    codonfilt <- taxreturn::codon_filter(filtered, genetic_code = ifelse(loci_name == "COI", "SGC4", "SGC0"), tryrc = TRUE, resolve_draws = "majority")
+    
+    # Check for mixed clusters (misannotated sequences)
+    mixed_clusters <- taxreturn::get_mixed_clusters(codonfilt, db, rank="species", threshold=0.99, return="consensus", confidence=0.8, quiet=FALSE)
+    purged  <- subset.DNAbin(codonfilt, subset = !str_replace(names(codonfilt), "(?:.(?!;))+$", "") %in% mixed_clusters$Acc)
+ #
+    ## prune over-represented groups - prefering inhouse sequences in case of ties
+    #prefered_taxa <- fs::dir_ls("diagnostic_alignments/inhouse", glob=paste0("*",loci_name,"*")) %>%
+    #  map(function(x){
+    #    names(insect::readFASTA(x))
+    #  })%>%
+    #  unlist() %>%
+    #  unname()
+
+    #pruned <- prune_groups(purged, max_group_size = 5, discardby = "length", dedup = TRUE, prefer=prefered_taxa, quiet = FALSE)
+    
+    insect::writeFASTA(purged, file=paste0("diagnostic_alignments/reference/", loci_name, ".fa.gz"), compress=TRUE)
+
+    #Reformat to complete taxonomic heirarchy 
+    #hierarchy <- reformat_hierarchy(pruned, db=db, quiet=FALSE)
+
+	  #Write out results filtered results
+    #insect::writeFASTA(hierarchy, file=paste0("diagnostic_alignments/reference/", loci_name, ".fa.gz"), compress=TRUE)
+    
+    #Trace each sequence through filtering
+    seq_tracker <- tibble::enframe(names(seqs), name=NULL, value="seq") %>%
+      tidyr::separate(seq, into=c("acc", "tax_id", "species"), sep = "\\||;") %>%
+      mutate(uniqseqs = case_when(
+        acc %in% (names(uniqSeqs) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(uniqSeqs) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      #namefilt = case_when(
+      #  acc %in% (names(namefilt) %>% str_remove("\\|.*$")) ~ TRUE,
+      #  !acc %in% (names(namefilt) %>% str_remove("\\|.*$")) ~ FALSE
+      #),
+      misannot = case_when(
+        acc %in% (names(misannot) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(misannot) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      phmm = case_when(
+        acc %in% (names(filtered) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(filtered) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      codonfilt = case_when(
+        acc %in% (names(codonfilt) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(codonfilt) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      purged = case_when(
+        acc %in% (names(purged) %>% str_remove("\\|.*$")) ~ TRUE,
+        !acc %in% (names(purged) %>% str_remove("\\|.*$")) ~ FALSE
+      ),
+      #pruned = case_when(
+      #  acc %in% (names(pruned) %>% str_remove("\\|.*$")) ~ TRUE,
+      #  !acc %in% (names(pruned) %>% str_remove("\\|.*$")) ~ FALSE
+      #),
+      loci = loci_name)
+
+    return(seq_tracker)
+})%>%
+  bind_rows()
+
+
+#write_csv(filt, "filter_stats_amplicon.csv")
+
+target_list <- readxl::read_xlsx("sample_data/primer_identifications_MKS_JR_MLS.xlsx") %>%
+  janitor::clean_names() %>%
+  dplyr::select(lure = x2, species = spp)  %>%
+  mutate(species = species %>% str_replace_all(" ", "_")) %>%
+  mutate(species = species %>% str_replace("Bactrocera_sp._nr._quadrata", "Bactrocera_nr.quadrata"))%>%
+  mutate(species = species %>% str_replace("Bactrocera_tenufascia", "Bactrocera_tenuifascia"))
+
+filt <- read_csv("filter_stats_amplicon.csv")
+
+
+test <- target_list %>% 
+  left_join(filt)
+
+
+filt %>%
+  pivot_longer(-loci,
+               names_to="step",
+               values_to="seqs") %>%
+  mutate(step = factor(step, levels=c("seqs", "uniqseqs", "namefilt", "phmm", "codonfilt", "purged"))) %>%
+  ggplot(aes(x = step, y = seqs))+
+  geom_col()+
+  facet_grid(loci~., scales="free_y")
+
+```
+
+## Train IDTAXA
+
+```{R}
+#Load NCBI taxonomy
+db <- get_ncbi_taxonomy()
+
+
+### TRAIN EIF3L
+
+seqs <- insect::readFASTA("diagnostic_alignments/reference/EIF3L.fa.gz") %>%
+  reformat_hierarchy(db = db)
+
+lineage <- names(seqs)%>% 
+            stringr::str_split_fixed(";", n = Inf) %>% 
+              tibble::as_tibble() %>%
+  magrittr::set_colnames(c("acc", "kingdom", 
+    "phylum", "class", "order", "family", 
+    "genus", "species")) %>%
+  na_if("NA") 
+
+# Fill in missing
+missing_fill <- lineage %>%
+  dplyr::select(acc, genus, species) %>%
+  filter(is.na(genus)) %>%
+  mutate(genus = str_remove(species, "_.*$")) %>%
+  left_join(db %>% dplyr::select(c("kingdom", 
+    "phylum", "class", "order", "family", 
+    "genus")) %>% distinct())
+  
+# coalesce join with the unqiue ones
+names(seqs) <- lineage %>%
+  dplyr::rows_update(missing_fill)  %>%
+  tidyr::unite(col = "names", c("acc", "kingdom", 
+    "phylum", "class", "order", "family", 
+    "genus", "species"), sep = ";") %>%
+  pull(names)
+
+# Write out refernce sets
+seq_ref <- seqs
+names(seq_ref) <- names(seqs) %>% str_replace_all("_", " ")
+insect::writeFASTA(seq_ref, "reference/EIF3L_hierarchial.fa")
+  
+# Train IDTAXA
+training_set <- train_idtaxa(
+  seqs, max_group_size = 10, max_iterations = 3,  
+  allow_group_removal = TRUE,  get_lineage = FALSE, quiet = FALSE
+  )
+
+#Write out training set
+dir.create("reference")
+saveRDS(training_set, file="reference/EIF3L_idtaxa.rds")
+
+### TRAIN COI
+
+seqs <- insect::readFASTA("diagnostic_alignments/reference/COI.fa") %>%
+  reformat_hierarchy(db = db)
+
+lineage <- names(seqs)%>% 
+            stringr::str_split_fixed(";", n = Inf) %>% 
+              tibble::as_tibble() %>%
+  magrittr::set_colnames(c("acc", "kingdom", 
+    "phylum", "class", "order", "family", 
+    "genus", "species")) %>%
+  na_if("NA") 
+
+# Fill in missing
+missing_fill <- lineage %>%
+  dplyr::select(acc, genus, species) %>%
+  filter(is.na(genus)) %>%
+  mutate(genus = str_remove(species, "_.*$")) %>%
+  left_join(db %>% dplyr::select(c("kingdom", 
+    "phylum", "class", "order", "family", 
+    "genus")) %>% distinct())
+  
+# coalesce join with the unqiue ones
+names(seqs) <- lineage %>%
+  dplyr::rows_update(missing_fill)  %>%
+  tidyr::unite(col = "names", c("acc", "kingdom", 
+    "phylum", "class", "order", "family", 
+    "genus", "species"), sep = ";") %>%
+  pull(names)
+
+# Write out refernce sets
+seq_ref <- seqs
+names(seq_ref) <- names(seqs) %>% str_replace_all("_", " ")
+insect::writeFASTA(seq_ref, "reference/COI_hierarchial.fa")
+
+  
+# Train IDTAXA
+training_set <- train_idtaxa(
+  seqs, max_group_size = 10, max_iterations = 3,  
+  allow_group_removal = TRUE,  get_lineage = FALSE, quiet = FALSE
+  )
+
+#Write out training set
+dir.create("reference")
+saveRDS(training_set, file="reference/COI_idtaxa.rds")
+
+```
+
+
+# Check presence of targets
+
+```{r}
+
+
+# Counts after filtering, and write out 
+cleaned_counts <- target_list %>%
+  left_join(fs::dir_ls(path="diagnostic_alignments/reference", glob = "*.fa.gz") %>%
+  purrr::map_dfr(function(x){
+  print(x)
+  seqs <- insect::readFASTA(x)
+  names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
+  loci_name <- basename(as.character(x)) %>% 
+    str_remove("\\..*$")
+    
+  spp <- tibble::enframe(names(seqs), name=NULL, value="species") %>%
+    mutate(species = species %>% str_remove("^.*;")) %>%
+    group_by(species) %>%
+    summarise(n = n()) %>%
+    mutate(loci = loci_name)
+})) %>%
+  tidyr::pivot_wider(names_from = loci,
+                     values_from = n,
+                     values_fill = list(n=0)) %>%
+  dplyr::select(-`NA`)
+
+cleaned_counts %>% 
+  mutate(COI = case_when(
+    COI > 10 ~ as.integer(10),
+    TRUE ~ as.integer(COI)
+  ),
+  EIF3L = case_when(
+    EIF3L > 10 ~ as.integer(10),
+    TRUE ~ as.integer(EIF3L)
+  )) %>%
+  write_csv("cleaned_counts.csv")
+
+
+# Orignal counts before filtering
+merged_counts <- target_list %>%
+  left_join(fs::dir_ls(path="diagnostic_alignments/merged", glob = "*.fa.gz") %>%
+  purrr::map_dfr(function(x){
+  print(x)
+  seqs <- insect::readFASTA(x)
+  names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
+  loci_name <- basename(as.character(x)) %>% 
+    str_remove("\\..*$")%>% 
+    str_remove("_merged")
+    
+  spp <- tibble::enframe(names(seqs), name=NULL, value="species") %>%
+    mutate(species = species %>% str_remove("^.*;")) %>%
+    group_by(species) %>%
+    summarise(n = n()) %>%
+    mutate(loci = loci_name)
+})) %>%
+  tidyr::pivot_wider(names_from = loci,
+                     values_from = n,
+                     values_fill = list(n=0)) %>%
+  dplyr::select(-`NA`)
+
+
+# Find ones removed by filtering
+spp_filtered_out <- (merged_counts %>%
+  dplyr::select(-genus, -lure) %>%
+  distinct() %>%
+  column_to_rownames("species") >0
+  ) - (cleaned_counts %>%
+  dplyr::select(-genus, -lure) %>%
+  distinct() %>%
+  column_to_rownames("species") >0 ) %>%
+  as.data.frame() %>%
+  dplyr::select(COI, EIF3L)
+
+spp_filtered_out <- spp_filtered_out[rowSums(spp_filtered_out) > 0,]
+
+
+# Get all witho
+
+# Need to check why they were filtered
+
+# Check which ones are covered by pblic sequencs
+```
+
+
+# make some alignments of just targets
+
+```{r}
+
+target_list <- readxl::read_xlsx("sample_data/primer_identifications_MKS_JR_MLS.xlsx") %>%
+  janitor::clean_names() %>%
+  dplyr::select(lure = x2, species = spp)  %>%
+  mutate(species = species %>% str_replace_all(" ", "_")) %>%
+  mutate(species = species %>% str_replace("Bactrocera_sp._nr._quadrata", "Bactrocera_nr.quadrata"))%>%
+  mutate(species = species %>% str_replace("Bactrocera_tenufascia", "Bactrocera_tenuifascia"))
+
+
+dir.create("diagnostic_alignments/cleaned/targets")
+
+fs::dir_ls(path="diagnostic_alignments/cleaned/", glob = "*.fa.gz")%>%
+  purrr::map(function(x){
+    loci_name <- basename(as.character(x)) %>% 
+      str_remove("_.*$")
+    
+    seqs <- insect::readFASTA(x)
+    names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
+   
+    subset_seqs <- seqs[(names(seqs)  %>% str_remove("^.*;")) %in% target_list$species]
+    insect::writeFASTA(subset_seqs, paste0("diagnostic_alignments/cleaned/targets/",loci_name))
+})
+
+
+
+```
 
 # Sequence logos
 

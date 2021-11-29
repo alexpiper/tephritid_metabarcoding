@@ -184,17 +184,17 @@ evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_positio
   # if positions is character of length 2, its start and end position of primer
   if (is(positions, "numeric") & length(positions) == 2){
     start <- sort(positions)[1]
-    stop <- sort(positions)[2]
+    end <- sort(positions)[2]
   } else if (is.null(positions)){
     model <- aphid::derivePHMM(x)
     positions <- get_binding_position()
     start <-  sort(positions)[1]
-    stop <- sort(positions)[2]
+    end <- sort(positions)[2]
   } else {
-    stop("Positions must be a vector of length 2 containing the start and stop position within the alignment, or NULL to automatically detect")
+    stop("Positions must be a vector of length 2 containing the start and end position within the alignment, or NULL to automatically detect")
   }
   # check primer length
-  if(!(stop+1 - start) == nchar(primer)){
+  if(!(end+1 - start) == nchar(primer)){
     stop("length of the given region does NOT match the primer length")
   }
   
@@ -207,7 +207,7 @@ evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_positio
   alignment <- apply(alignment, 2 ,toupper)
   
   # extract primer binding region
-  primer_region <- alignment[,start:stop]
+  primer_region <- alignment[,start:end]
   
   # If direction is R - make rev comp of alignment
   if(direction=="R"){
