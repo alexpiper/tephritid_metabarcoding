@@ -1,0 +1,293 @@
+---
+title: "cross_validation"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load packages
+
+```{r}
+#Set required packages
+.cran_packages <- c(
+  "devtools",
+  "ggplot2",
+  "tidyverse", 
+  "patchwork",
+  "ape",
+  "stringi",
+  "magrittr"
+  )
+
+.bioc_packages <- c(
+  "phyloseq",
+  "DECIPHER",
+  "Biostrings",
+  "ShortRead",
+  "ggtree"
+  )
+
+.inst <- .cran_packages %in% installed.packages()
+if(any(!.inst)) {
+   install.packages(.cran_packages[!.inst])
+}
+.inst <- .bioc_packages %in% installed.packages()
+if(any(!.inst)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)){
+    install.packages("BiocManager")
+  }
+  BiocManager::install(.bioc_packages[!.inst], ask = F)
+}
+
+#Load all published packages
+sapply(c(.cran_packages,.bioc_packages), require, character.only = TRUE)
+
+# Install and load github packages
+devtools::install_github("alexpiper/seqateurs", dependencies = TRUE)
+library(seqateurs)
+
+devtools::install_github("alexpiper/taxreturn", dependencies = TRUE)
+library(taxreturn)
+
+
+```
+
+# Assign back cross validation
+
+This test assigns all the reference sequences back to the database without leaving any out
+
+## COI 
+
+```{r COI}
+trainingSet <- readRDS("reference/COI_idtaxa.rds")
+
+# get the sequences from the subset seqtab
+dna <- readDNAStringSet("reference/COI_hierarchial.fa")
+  
+dna <- RemoveGaps(dna)
+
+# Classify for that ref_db
+ids <- IdTaxa(dna, trainingSet, processors=1, threshold = 60, verbose=TRUE, strand = "top") 
+  
+ranks <-  c("Root","Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") 
+
+#Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+tax <- t(sapply(ids, function(x) {
+  taxa <- paste0(x$taxon,"_", x$confidence)
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+})) %>%
+  purrr::map(unlist) %>%
+  stri_list2matrix(byrow=TRUE, fill=NA) %>%
+  magrittr::set_colnames(ranks) %>%
+  as.data.frame() %>%
+  magrittr::set_rownames(names(dna)) %>%
+  mutate_all(str_replace,pattern="(?:.(?!_))+$", replacement="") %>%
+  magrittr::set_rownames(names(dna)) 
+  
+# Top hit with BLAST
+seqs <- as.DNAbin(dna)
+names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
+
+blast_spp <- blast_assign_species(query=seqs,db="reference/COI_hierarchial.fa", identity=97, coverage=95, evalue=1e06,
+                                  max_target_seqs=5, max_hsp=5,
+                                  ranks=c("Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") , delim=";") %>%
+    dplyr::rename(blast_genus = Genus, blast_spp = Species) %>%
+    dplyr::filter(!is.na(blast_spp))
+  
+#Join together
+tax_blast <- tax %>%
+  as_tibble(rownames = "OTU") %>%
+  mutate(OTU = OTU  %>% str_replace_all(" ", "_")) %>%
+  left_join(blast_spp, by="OTU") %>%
+  mutate(Species = Species %>% str_replace_all("_", " ")) %>%
+  dplyr::mutate(Species = case_when(
+    is.na(Species) & Genus == blast_genus ~ blast_spp,
+    !is.na(Species) ~ Species 
+  )) %>%
+  dplyr::select(OTU, Genus, Species)
+
+
+# Look at which ones are unique and which mixed
+
+coi_id_success <- tax_blast %>%
+  filter(!str_detect(Species, "  fly")) %>%
+  mutate(expected = OTU %>% str_remove("^.*;")) %>%
+  mutate(Species = na_if(Species, ""),
+         Species = Species %>% str_replace_all(" ", "_")) %>%
+  mutate(id = case_when(
+    expected == Species ~ "correct",
+    !expected == Species & str_detect(Species, "/") ~ "mixed",
+    expected == Species & !str_detect(Species, "/") ~ "misclass",
+    is.na(Species) ~ "underclass",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(Species = Species %>% str_remove("^.*_")) %>%
+  group_by(expected) %>%
+  dplyr::summarise(
+    res = paste(sort(unique(id)), 
+        collapse = "/"),
+    Species = paste(sort(unique(Species)), 
+        collapse = "/")) %>%
+  mutate(Species = purrr::map(Species, ~{.x %>% str_split("/") %>% unlist() %>%sort() %>% unique() %>% paste(collapse="/")})) %>%
+  mutate(Genus = str_extract(expected, "^.*_") %>% str_remove("_")) %>%
+  mutate(Binom = paste0(Genus, "_", Species))
+
+
+# Create summary
+coi_id_success  %>%
+  unnest(Species) %>%
+  write_tsv("reference/coi_id_list.tsv")
+
+# Make edited taxonomy file
+
+db <- get_ncbi_taxonomy()
+
+seqs <- insect::readFASTA("reference/COI_hierarchial.fa") 
+seqs <- seqs[!str_detect(names(seqs),"  fly")]
+
+# Rename taxa that couldnt be identified
+renamed <- tibble::enframe(names(seqs), value="name", name=NULL) %>%
+  mutate(name = name %>% str_replace_all(" ", "_"))%>%
+  mutate(expected = str_remove(name, "^.*;")) %>%
+  left_join(coi_id_success) %>%
+  mutate(name = case_when(
+    str_detect(res, "mixed") ~ name %>% str_replace(expected, Binom),
+    TRUE ~ name
+  ))
+
+seqs2 <- seqs
+names(seqs2) <- renamed$name
+
+insect::writeFASTA(seqs2, "reference/COI_hierarchial_renamed.fa")
+
+# Train IDTAXA
+training_set <- train_idtaxa(
+  seqs2, max_group_size = 10, max_iterations = 3,  
+  allow_group_removal = TRUE,  get_lineage = FALSE, quiet = FALSE
+  )
+
+#Write out training set
+dir.create("reference")
+saveRDS(training_set, file="reference/COI_idtaxa_renamed.rds")
+```
+
+
+## EIF3L 
+```{r IDTAXA BLAST}
+trainingSet <- readRDS("reference/EIF3L_idtaxa.rds")
+
+# get the sequences from the subset seqtab
+dna <- readDNAStringSet("reference/EIF3L_hierarchial.fa")
+  
+dna <- RemoveGaps(dna)
+
+# Classify for that ref_db
+ids <- IdTaxa(dna, trainingSet, processors=1, threshold = 60, verbose=TRUE, strand = "top") 
+  
+ranks <-  c("Root","Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") 
+
+#Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+tax <- t(sapply(ids, function(x) {
+  taxa <- paste0(x$taxon,"_", x$confidence)
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+})) %>%
+  purrr::map(unlist) %>%
+  stri_list2matrix(byrow=TRUE, fill=NA) %>%
+  magrittr::set_colnames(ranks) %>%
+  as.data.frame() %>%
+  magrittr::set_rownames(names(dna)) %>%
+  mutate_all(str_replace,pattern="(?:.(?!_))+$", replacement="") %>%
+  magrittr::set_rownames(names(dna)) 
+  
+# Top hit with BLAST
+seqs <- as.DNAbin(dna)
+names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
+
+blast_spp <- blast_assign_species(query=seqs,db="reference/EIF3L_hierarchial.fa", identity=97, coverage=95, evalue=1e06,
+                                  max_target_seqs=5, max_hsp=5,
+                                  ranks=c("Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") , delim=";") %>%
+    dplyr::rename(blast_genus = Genus, blast_spp = Species) %>%
+    dplyr::filter(!is.na(blast_spp))
+  
+#Join together
+tax_blast <- tax %>%
+  as_tibble(rownames = "OTU") %>%
+  mutate(OTU = OTU  %>% str_replace_all(" ", "_")) %>%
+  left_join(blast_spp, by="OTU") %>%
+  mutate(Species = Species %>% str_replace_all("_", " ")) %>%
+  dplyr::mutate(Species = case_when(
+    is.na(Species) & Genus == blast_genus ~ blast_spp,
+    !is.na(Species) ~ Species 
+  )) %>%
+  dplyr::select(OTU, Genus, Species)
+
+
+# Look at which ones are unique and which mixed
+
+eif3l_id_success <- tax_blast %>%
+  filter(!str_detect(Species, "  fly")) %>%
+  mutate(expected = OTU %>% str_remove("^.*;")) %>%
+  mutate(Species = na_if(Species, ""),
+         Species = Species %>% str_replace_all(" ", "_")) %>%
+  mutate(id = case_when(
+    expected == Species ~ "correct",
+    !expected == Species & str_detect(Species, "/") ~ "mixed",
+    expected == Species & !str_detect(Species, "/") ~ "misclass",
+    is.na(Species) ~ "underclass",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(Species = Species %>% str_remove("^.*_")) %>%
+  group_by(expected) %>%
+  dplyr::summarise(
+    res = paste(sort(unique(id)), 
+        collapse = "/"),
+    Species = paste(sort(unique(Species)), 
+        collapse = "/")) %>%
+  mutate(Species = purrr::map(Species, ~{.x %>% str_split("/") %>% unlist() %>%sort() %>% unique() %>% paste(collapse="/")})) %>%
+  mutate(Genus = str_extract(expected, "^.*_") %>% str_remove("_")) %>%
+  mutate(Binom = paste0(Genus, "_", Species))
+
+# Create summary
+eif3l_id_success  %>%
+    unnest(Species) %>%
+  write_tsv("reference/eif3l_id_list.tsv")
+
+# Make edited taxonomy file
+db <- get_ncbi_taxonomy()
+
+seqs <- insect::readFASTA("reference/EIF3L_hierarchial.fa") 
+
+# Rename taxa that couldnt be identified
+renamed <- tibble::enframe(names(seqs), value="name", name=NULL) %>%
+  mutate(expected = str_remove(name, "^.*;")) %>%
+  left_join(eif3l_id_success) %>%
+  mutate(name = case_when(
+    str_detect(res, "mixed") ~ name %>% str_replace(expected, Binom),
+    TRUE ~ name
+    
+  ))
+
+seqs2 <- seqs
+names(seqs2) <- renamed$name
+
+insect::writeFASTA(seqs2, "reference/EIF3L_hierarchial_renamed.fa")
+
+# Train IDTAXA
+training_set <- train_idtaxa(
+  seqs2, max_group_size = 10, max_iterations = 3,  
+  allow_group_removal = TRUE,  get_lineage = FALSE, quiet = FALSE
+  )
+
+#Write out training set
+dir.create("reference")
+saveRDS(training_set, file="reference/EIF3L_idtaxa_renamed.rds")
+# Rename taxa
+
+```
+

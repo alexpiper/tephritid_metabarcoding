@@ -80,12 +80,29 @@ source('R/themes.R')
 ```{r phyloseq}
 ps1 <- readRDS("output/rds/ps_filtered.rds")
 
+# Flip sample 6 and 7 were mixed around
+
+#trap_names <- c(
+#  "CN-13-CUE_2021-01-25",
+#  "BRP-01-CUE_2020-09-28",
+#  "CN-13-CUE_2020-11-04",
+#  "CN-15-CUE_2020-11-17",
+#  "BRP-08-CUE_2020-09-28",
+#  "CN-15-CUE_2021-01-12",
+#  "CN-13-CUE_2020-11-17",
+#  "CN-16-CUE_2020-10-20",
+#  "CN-15-CUE_2020-09-09",
+#  "MT-01-ME_2021-01-02",
+#  "CK-01-ME_2020-11-16"
+#)
+
+# Flip samples 6 and 7, and 2 and 5
 trap_names <- c(
   "CN-13-CUE_2021-01-25",
-  "BRP-01-CUE_2020-09-28",
+    "BRP-08-CUE_2020-09-28",
   "CN-13-CUE_2020-11-04",
   "CN-15-CUE_2020-11-17",
-  "BRP-08-CUE_2020-09-28",
+  "BRP-01-CUE_2020-09-28",
   "CN-15-CUE_2021-01-12",
   "CN-13-CUE_2020-11-17",
   "CN-16-CUE_2020-10-20",
@@ -108,6 +125,8 @@ sample_data(ps1) <- sample_data(ps1)  %>%
   mutate(sample_name = new_sample_name) %>%
   dplyr::select(-new_sample_name) %>%
   tibble::column_to_rownames(".sample")
+
+
 ```
 
 
@@ -158,38 +177,165 @@ summary_dat %>%
 # Taxa per primer
 summary_dat %>% 
   filter(Abundance > 0, !is.na(Abundance)) %>%
-  group_by(pcr_primers) %>%
-  summarise(unique = n_distinct(Species)) 
+    mutate(mixed = str_detect(Species, "/")) %>%
+  group_by(pcr_primers, mixed) %>%
+  summarise(unique_spp = n_distinct(Species), unique_asv=n_distinct(OTU)) 
+
+# Taxa uniquely identified by either primerxc
+summary_dat %>% 
+  filter(Abundance > 0, !is.na(Abundance)) %>%
+  mutate(mixed = str_detect(Species, "/")) %>%
+  group_by(Species) %>%
+  summarise(both_mixed = all(mixed)) %>%
+  ungroup() %>%
+  group_by(both_mixed) %>%
+  summarise(unique_spp = n_distinct(Species)) 
+
 
 ```
 
 # Heatmaps
 
 ```{R}
+# BRP-01-CUE_2020-09-28 > BRP-08-CUE_2020-09-28 ?
+
+# Rename taxa that could not be identified originally to just the genus
+id_success <- bind_rows(
+  read_tsv("reference/coi_id_list.tsv") %>%
+  dplyr::select(Species = expected, Binom, res) %>%
+  mutate(Species = Species %>% str_replace_all("_", " "),
+         Binom = Binom %>% str_replace_all("_", " "),
+         pcr_primers = "fwhF2-fwhR2nDac"),
+  read_tsv("reference/eif3l_id_list.tsv") %>%
+  dplyr::select(Species = expected,  Binom, res) %>%
+  mutate(Species = Species %>% str_replace_all("_", " "),
+         Binom = Binom %>% str_replace_all("_", " "),
+         pcr_primers = "EIF3LminiF4-EIF3lminiR4")
+)
+
+# LOad in expected composition
+exp_composition <- bind_rows(
+    read_csv("sample_data/expected_quant.csv") %>%
+      pivot_longer(-sample_name,
+                   names_to= "Species",
+                   values_to= "expected")%>% 
+      mutate(pcr_primers = "fwhF2-fwhR2nDac"),
+    read_csv("sample_data/expected_quant.csv") %>%
+        pivot_longer(-sample_name,
+                     names_to= "Species",
+                     values_to= "expected")%>% 
+        mutate(pcr_primers = "EIF3LminiF4-EIF3lminiR4")
+  ) %>%
+  filter(!is.na(expected)) %>%
+  mutate(species_new = purrr::map2(Species, pcr_primers, ~{
+    id_success_loci <- id_success %>% 
+      filter(pcr_primers == .y)%>%
+      mutate(Species_only = str_remove(Species, "^.* "))%>%
+      mutate(binom_species_only = str_remove(Binom, "^.* "))
+
+    # Recursively match all names
+    to_match <- .x %>% str_remove("^.* ") %>% str_split("/") %>% unlist() %>% sort() %>% unique()
+    matched <- vector("character")
+    while(length(to_match) > 0){
+      new_match <- id_success_loci$binom_species_only[match(to_match, id_success_loci$Species_only)]%>% 
+        str_split("/") %>% 
+        unlist() %>%
+        sort() %>%
+        unique()
+      to_match <- new_match[!new_match %in% matched]
+      matched <- unique(c(matched, new_match))
+      }
+    
+    out <- paste0(.x %>% str_remove(" .*$"), " ", (matched %>%
+      sort() %>%
+      unique() %>% 
+      paste(collapse="/")))
+    return(out)
+    })) %>%
+  unnest(species_new) %>%
+  mutate(Species = species_new) %>%
+  dplyr::select(-species_new)%>%
+  mutate(species_new2 = case_when(
+    str_detect(Species, "dorsalis") & (str_count(Species, "/") > 4) ~ "Bactrocera dorsalis complex",
+    str_detect(Species, "tryoni|neohumeralis|aquilonis|melas|curvipennis|ustulata|mutabilis") ~ "Bactrocera tryoni complex",
+    str_detect(Species, "repanda|alyxiae") ~ "Bactrocera alyxiae/repanda",
+    str_detect(Species, "bryoniae/linduensis") ~ "Bactrocera bryoniae",
+    str_detect(Species, "mayi|tenuifascia") ~ "Bactrocera mayi/tenuifascia",
+    str_detect(Species, "albistrigata|frauenfeldi|kirki|fagraea|psidii") ~ "Bactrocera albistrigata/frauenfeldi/kirki/psidii",
+    str_detect(Species, "cacuminata|makilingensis|commensurata") ~ "Bactrocera opiliae",
+    str_detect(Species, "yorkensis|breviaculeus|rufofuscula|carbonaria") ~ "Bactrocera breviaculeus/peninsularis/rufofuscula",
+    #pcr_primers == "EIF3LminiF4-EIF3lminiR4"& str_detect(Species, "~ 
+    TRUE ~ Species
+  )) %>%
+  dplyr::select(sample_name, Species = species_new2, expected, pcr_primers) %>%
+  group_by(sample_name, pcr_primers, Species) %>%
+  summarise(expected = sum(expected)) %>%
+  ungroup() 
+
+
 # Heatmap separate for primers
 heatmap_dat <-  ps1 %>%
   speedyseq::psmelt() %>%
-  dplyr::select(sample_id, OTU, sample_name, Abundance, pcr_primers, Species) %>%
-  #filter(!str_detect(Species, "__")) %>%
+  filter(Abundance > 0) %>% 
+    mutate(species_new = purrr::map2(Species, pcr_primers, ~{
+    id_success_loci <- id_success %>% 
+      filter(pcr_primers == .y)%>%
+      mutate(Species_only = str_remove(Species, "^.* "))%>%
+      mutate(binom_species_only = str_remove(Binom, "^.* "))
+
+    # Recursively match all names
+    to_match <- .x %>% str_remove("^.* ") %>% str_split("/") %>% unlist() %>% sort() %>% unique()
+    matched <- vector("character")
+    while(length(to_match) > 0){
+      new_match <- id_success_loci$binom_species_only[match(to_match, id_success_loci$Species_only)]%>% 
+        str_split("/") %>% 
+        unlist() %>%
+        sort() %>%
+        unique()
+      to_match <- new_match[!new_match %in% matched]
+      matched <- unique(c(matched, new_match))
+      }
+    
+    out <- paste0(.x %>% str_remove(" .*$"), " ", (matched %>%
+      sort() %>%
+      unique() %>% 
+      paste(collapse="/")))
+    return(out)
+    })) %>%
+  unnest(species_new) %>%
+  mutate(Species = species_new) %>%
+  dplyr::select(-species_new) %>%
+  # MAnually correct some
+  mutate(species_new2 = case_when(
+    str_detect(Species, "dorsalis") & (str_count(Species, "/") > 4) ~ "Bactrocera dorsalis complex",
+    str_detect(Species, "tryoni|neohumeralis|aquilonis|melas|curvipennis|ustulata|mutabilis") ~ "Bactrocera tryoni complex",
+    str_detect(Species, "repanda|alyxiae") ~ "Bactrocera alyxiae/repanda",
+    str_detect(Species, "bryoniae/linduensis") ~ "Bactrocera bryoniae",
+    str_detect(Species, "mayi|tenuifascia") ~ "Bactrocera mayi/tenuifascia",
+    str_detect(Species, "albistrigata|frauenfeldi|kirki|fagraea|psidii") ~ "Bactrocera albistrigata/frauenfeldi/kirki/psidii",
+    str_detect(Species, "cacuminata|makilingensis|commensurata") ~ "Bactrocera opiliae",
+    str_detect(Species, "yorkensis|breviaculeus|rufofuscula|carbonaria") ~ "Bactrocera breviaculeus/peninsularis/rufofuscula",
+    #pcr_primers == "EIF3LminiF4-EIF3lminiR4"& str_detect(Species, "~ 
+    TRUE ~ Species
+  )) %>%
+  dplyr::select(sample_id, OTU, sample_name, Abundance, pcr_primers, Species = species_new2) %>%
+  filter(!str_detect(Species, "__")) %>%
+  group_by(sample_id, sample_name, pcr_primers, Species) %>%
+  summarise(Abundance = sum(Abundance)) %>%
+  ungroup() %>%
   group_by(sample_id, pcr_primers) %>%
   mutate_at(vars(Abundance), ~ . / sum(.) ) %>%
   ungroup() %>%
-  filter(Abundance > 0) %>% 
-  #mutate(Abundance = case_when(
-  #  Abundance <0.00011 ~ as.numeric(NA),
-  #  Abundance > 0.00011 ~ Abundance
-  #)) %>%
-  #mutate(Abundance = na_if(Abundance, 0))  %>%
-  left_join(read_csv("sample_data/expected_quant.csv") %>%
-  pivot_longer(-sample_name,
-               names_to= "Species",
-               values_to= "expected") %>%
-    mutate(Species = Species %>% str_replace(" ", "_")), by = c("sample_name","Species")) %>%
+    filter(Abundance > 1e-04) %>%
+  full_join(exp_composition, by = c("sample_name","Species", "pcr_primers")) %>%
   mutate(expected = replace_na(expected, 0)) %>%
   mutate(outcome = case_when(
     Abundance > 0 & expected == 0 ~ "FP",
+    Abundance > 0 & expected > 0 ~ "TP",
     is.na(Abundance) & expected > 0 ~ "FN"
-  )) %>%
+  ))  %>%
+  group_by(Species, pcr_primers) %>%
+  mutate(prev = n_distinct(sample_name)) %>%
   filter(!(is.na(Abundance) & is.na(outcome)))
 
 #Taxa that were different across primers
@@ -208,7 +354,7 @@ heatmap_dat %>%
   group_by(outcome, pcr_primers) %>%
   summarise(unique = n_distinct(Species)) 
 
-gg.unfilt_heatmap <- heatmap_dat %>%
+gg.filt_heatmap <- heatmap_dat %>%
   mutate(Species = factor(Species),
          sample_name = factor(sample_name, levels= trap_names)) %>%
     ggplot(aes(x=sample_name, y=Species, fill=Abundance)) +
@@ -225,60 +371,55 @@ gg.unfilt_heatmap <- heatmap_dat %>%
          y="Taxon") +
   facet_grid(~pcr_primers, drop=TRUE)
 
-gg.unfilt_heatmap
-
-# False positives per primer after filtering?
-heatmap_dat %>%
-  filter(!is.na(outcome), Abundance > 1e-04) %>%
-  group_by(outcome, pcr_primers) %>%
-  summarise(unique = n_distinct(Species)) 
-
-gg.filt_heatmap <- heatmap_dat %>%
-  dplyr::filter(Abundance > 1e-04) %>%
-  mutate(Species = factor(Species),
-         sample_name = factor(sample_name, levels= trap_names),
-         pcr_primers = factor(pcr_primers, levels=c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
-    ggplot(aes(x=sample_name, y=Species, fill=Abundance)) +
-    geom_tile() +
-  scale_fill_viridis_c(labels = scales::percent, na.value = NA, alpha=0.9) +
-  #new_scale_fill() +
- # geom_tile(aes(fill = outcome))+
-  #scale_fill_manual(values=c("FP" = "#e41a1c", "FN"= "grey60"), na.value = NA) +
-  base_theme+
-  theme(legend.position = "right",
-        axis.text.y = element_text(face="italic"),
-        axis.title.y = element_blank())+
-    labs(x="Sample",
-         y="Taxon") +
-  facet_grid(~pcr_primers, drop=TRUE)
-
 gg.filt_heatmap
+
+
+# Add a combined column
 
 pdf(file="fig/filt_heatmap.pdf", width = 11, height = 8 , paper="a4r")
   plot(gg.filt_heatmap)
+try(dev.off(), silent=TRUE)
+  
+# Plot of RA vs 
+fp_plotdat <- heatmap_dat %>%
+  filter(!outcome == "FN") %>%
+  mutate(outcome = outcome %>%
+           str_replace("FP", "False Positive") %>%
+           str_replace("TP", "True Positive"))
+
+gg.fp_plot <- fp_plotdat %>%
+  ggplot(aes(x = Abundance, y = prev, colour=pcr_primers)) + 
+  geom_point(size=2, position=position_jitter(height=0.1)) +
+  geom_label(data = fp_plotdat %>% dplyr::filter(outcome=="False Positive", Abundance > 0.1),
+             aes(label = paste0(sample_name, ": ", Species)),nudge_y = 0.5) +
+  scale_colour_brewer(palette = "Set1")+
+  #scale_colour_manual(values=c("False Positive" = "#e41a1c", "True Positive"="blue"), na.value = NA) +
+  base_theme +
+  facet_grid(outcome~.) +
+  theme(legend.position = "right") +
+  labs(x = "Relative abundance",
+       y = "Prevalence across samples")
+  
+gg.fp_plot
+
+pdf(file="fig/fp_abundance.pdf", width = 11, height = 8 , paper="a4r")
+  plot(gg.fp_plot)
 try(dev.off(), silent=TRUE)
 ```
 
 # Barplots
 
 ```{r barplots}
-summary_dat <- ps1 %>%
-  speedyseq::psmelt() %>%
-  dplyr::select(sample_id, OTU, sample_name, Abundance, pcr_primers, Species) %>%
-  #filter(!str_detect(Species, "__")) %>%
-  group_by(sample_id, pcr_primers) %>%
-  mutate_at(vars(Abundance), ~ . / sum(.) ) %>%
-  ungroup() %>%
-  filter(Abundance > 0) 
+mypal <- colorRampPalette( brewer.pal( 12 , "Paired" ) )
 
-gg.sample_bars <-  summary_dat  %>%
+gg.sample_bars <-  heatmap_dat  %>%
   ggplot(aes(x = sample_name, y = Abundance, fill=Species)) +
-  geom_col()+
+  geom_col(colour="black")+
   facet_grid(pcr_primers~.)+ 
   base_theme +
   theme(legend.position = "bottom")+
   #scale_fill_brewer(palette="Spectral")+
-  #scale_fill_manual(values= c(cols, "Other"= "grey80")) +
+  scale_fill_manual(values= mypal(length(unique(heatmap_dat$Species)))) +
   scale_y_continuous(labels = scales::percent_format(), expand=c(0,0)) +
   scale_x_reordered(expand=c(0,0)) +
   labs(fill = "Species",
@@ -296,99 +437,24 @@ try(dev.off(), silent=TRUE)
 # Bias
 
 ```{r}
-ps_bias <- ps1 %>%
-  tax_glom("Species")
-
-exp <- read_csv("sample_data/expected_quant.csv") %>%
-  pivot_longer(-sample_name,
-               names_to= "taxon",
-               values_to= "expected") %>%
-  dplyr::filter(!is.na(sample_name),
-  expected > 0) %>%
-  distinct() %>%
-  mutate(taxon = case_when(
-    taxon == "Bactrocera tenuifascia" | taxon == "Bactrocera mayi" ~ "Bactrocera mayi/tenuifascias",
-    taxon == "Bactrocera neohumeralis" ~ "Bactrocera tryoni", 
-    TRUE ~ taxon
-    )) %>%
-  group_by(taxon, sample_name) %>%
-  summarise(expected = sum(expected))
-
-#plot expected
-exp %>% 
-  group_by(sample_name) %>%
-  mutate_at(vars(expected), ~ . / sum(.) ) %>% #Convert to proportions
-  ggplot(aes(x=sample_name, y=expected, fill=taxon)) +
-  geom_col(position="stack") + 
-  #scale_fill_brewer(palette="Spectral") +
-  scale_y_continuous(labels=scales::percent) +
-  base_theme+
-  theme(legend.position = "bottom",
-        axis.text.x = element_text(angle=45, hjust=1)) +
-  labs(x = "Sample Name",
-       y= "Relative abundance",
-       title="Expected mock communities",
-       fill="Species")
-
-# Plot baR plots of expected, both primers
-
-#Get observed
-sam <- speedyseq::psmelt(ps_bias) %>%
-  filter(!str_detect(Species, "__")) %>%#Remove unclassified
-  dplyr::select(sample_id, sample_name, Species, Abundance, pcr_primers, fcid)  %>%
-  mutate(Species = case_when(
-  # Manually resolve taxonomic clashes at species level
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera aquilonis/tryoni" ~ "Bactrocera tryoni",
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera melas/neohumeralis/tryoni" ~ "Bactrocera tryoni" ,
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera aquilonis/neohumeralis/tryoni" ~ "Bactrocera tryoni",
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera aquilonis" ~ "Bactrocera tryoni",
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera neohumeralis" ~ "Bactrocera tryoni",
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera dorsalis/opiliae" ~ "Bactrocera opiliae", 
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera breviaculeus/kraussi/peninsularis" ~ "Bactrocera breviaculeus" ,
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera OTU5353/dorsalis" ~ "Bactrocera opiliae",
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera Sol12/bryoniae" ~ "Bactrocera bryoniae",
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera Sol12" ~ "Bactrocera bryoniae",
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera Sol12/linduensis" ~ "Bactrocera bryoniae",
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera cacuminata/opiliae" ~ "Bactrocera opiliae",
-    pcr_primers == "fwhF2-fwhR2nDac" & Species == "Bactrocera PNGFF067-10/PNGFF068-10/neocheesmanae" ~ "Bactrocera neocheesmanae",
-    
-    # Fix EIF3L
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera albistrigata/aquilonis/caledoniensis/neohumeralis" ~ "Bactrocera tryoni",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera erubescentis/tryoni/ustulata" ~ "Bactrocera tryoni",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera cacuminata/musae" ~ "Bactrocera musae",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera neohumeralis/tryoni" ~ "Bactrocera tryoni",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera neohumeralis" ~ "Bactrocera tryoni",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera aquilonis" ~ "Bactrocera tryoni",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera erubescentis/tryoni/ustulata" ~ "Bactrocera tryoni",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera alyxiae/repanda" ~ "Bactrocera alyxiae",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera curvipennis/tryoni/ustulata" ~ "Bactrocera tryoni",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera cacuminata/musae" ~ "Bactrocera musae",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera cacuminata/dorsalis" ~ "Bactrocera musae",
-    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & Species == "Bactrocera frauenfeldi/neohumeralis" ~ "Bactrocera neohumeralis",
-    TRUE ~ Species
-  )) %>%
-    mutate(taxon = Species)  %>%
-  group_by(sample_id, sample_name, taxon, pcr_primers, fcid) %>%
-  summarise(Abundance = sum(Abundance))
 
 # create a good pseudocount
 # this was chosen to give a proportion that is less than 1 divided by the maximum sample read depth
 # and so is expected to have negligible effect on the resulting estimates.
-pseudocount <- sam %>% 
-  group_by(sample_id) %>%
-  summarise(sum = sum(Abundance)) %>%
-  pull(sum)%>% 
-  max() %>% 
-  {1 / .}
+#pseudocount <- heatmap_dat %>% 
+#  group_by(sample_id, pcr_primers) %>%
+#  summarise(sum = sum(Abundance)) %>%
+#  pull(sum)%>% 
+#  max(na.rm = TRUE) %>% 
+#  {1 / .}
+#
+# Use the filt threshold for pseudocoubt
+pseudocount <- 1e-4
 
 #Join expected and observed tables 
-joint <- sam %>%
-  filter(taxon %in% exp$taxon,
-         sample_name %in% exp$sample_name) %>%
-  left_join(exp, by = c("sample_name","taxon")) %>%
-  dplyr::rename(observed = Abundance) %>%
-  filter(observed > 0) %>%
-    group_by(sample_id, pcr_primers) %>%
+joint <- heatmap_dat %>%
+  dplyr::rename(observed = Abundance, taxon=Species) %>%
+  group_by(sample_id, pcr_primers) %>%
   mutate_at(vars(observed, expected), ~ . / sum(.) ) %>% #Convert to proportions
   ungroup() %>%
   mutate(expected = replace_na(expected, 0),
@@ -403,9 +469,7 @@ joint <- sam %>%
      gm_mean()
     .x %>%
      mutate(err_clr = log(error / clr_denom))
-            })
-
-  #filter(observed > 1e-4) #Remove taxa under threshold
+  })
 
 # Visualise the error in all pairwise ratios
 gg.ratio <- joint %>%
@@ -510,13 +574,15 @@ gm_quantiles <- function (x, q = c(0.25, 0.5, 0.75), na_rm = FALSE, wide=FALSE) 
   return(out)
 }
 
-gg.final_ests <- boot_coefs  %>%
+final_ests <- boot_coefs  %>%
     group_by(taxon, pcr_primers) %>%
     summarise(gm_quantiles(estimate, q = c(0.05, 0.25, 0.75, 0.95), na_rm=TRUE, wide=TRUE),
               gm_mean = metacal::gm_mean(estimate, na.rm=TRUE),
               gm_se = metacal::gm_sd(estimate, na.rm = TRUE)) %>%
     ungroup %>%
-    rename_with(~gsub("^q", "gm_", .x), starts_with("q")) %>%
+    rename_with(~gsub("^q", "gm_", .x), starts_with("q")) 
+
+gg.final_ests <- final_ests %>%
   ggplot(aes(x=gm_mean , y=taxon, colour=taxon, fill=taxon))+ #
   geom_vline(xintercept = 1, colour="grey80" )  +
   geom_interval(aes(xmin = gm_05, xmax =gm_95 ), alpha=0.5, size=3) +
@@ -544,119 +610,211 @@ gg.final_ests <- boot_coefs  %>%
 gg.final_ests
 
 
+# Read in mismatch data
+mismatch <- read_tsv("output/mismatch.tsv") %>%
+  filter(primer %in% c("fwhF2", "fwhR2nDac", "EIF3L_miniF4", "EIF3L_miniR4")) %>%
+  pivot_longer(-c("template_name", "template_seq", "direction", "primer", "primer_seq", "loci"),
+               names_to = "position",
+               values_to = "mismatch") %>%
+  group_by(template_name, primer) %>% 
+  summarise(mismatch = sum(mismatch, na.rm = TRUE)) %>%
+  mutate(Species = template_name %>% str_remove("^.*;")) %>%
+  group_by(Species, primer) %>%
+  summarise(mean_mismatch = mean(mismatch)) %>%
+  pivot_wider(names_from = "primer",
+              values_from = "mean_mismatch") %>%
+  mutate(`fwhF2-fwhR2nDac` = sum(fwhF2, fwhR2nDac),
+         `EIF3LminiF4-EIF3lminiR4` = sum(EIF3L_miniF4, EIF3L_miniR4)) %>%
+  dplyr::select(Species, `fwhF2-fwhR2nDac`,`EIF3LminiF4-EIF3lminiR4`) %>%
+  pivot_longer(-Species,
+               names_to = "pcr_primers",
+               values_to = "pred_mismatch") %>%
+  mutate(spp_only = Species %>% str_remove("^.*_"),
+         genus = Species %>% str_remove("_.*$"))
+  
+mismatch_joint <- final_ests %>%
+  dplyr::rename(Species = taxon ) %>%
+  #group_by(Species) %>%
+  mutate(pred_mismatch = purrr::map2_dbl(Species,pcr_primers, function(x,y){
+    if(x == "Bactrocera tryoni complex"){
+      print("test")
+      to_match <- c("tryoni", "neohumeralis", "aquilonis", "melas", "curvipennis", "ustulata","mutabilis")
+    } else{
+      to_match <- x %>% str_remove("^.* ") %>% str_split("/") %>% unlist() %>% sort() %>% unique()
+    }
+    mismatch_genus <- mismatch %>%
+      dplyr::filter(genus == x %>% str_remove(" .*$"), pcr_primers == y)
+    mean(mismatch_genus$pred_mismatch[match(to_match, mismatch_genus$spp_only)], na.rm=TRUE)
+  }))
 
-# Fit the metacal model to each pcr primer set and community type
-fit_metacal <- joint %>%
-  filter(expected > 0, observed > 0) %>%
-  group_by(pcr_primers)  %>%
-  nest() %>%
-    mutate(
-        fit = purrr::map(data, function(x){
-        obs_mat <- x %>%
-          dplyr::select(sample_id, taxon, observed0)%>%
-          pivot_wider(id_cols= sample_id,
-                      names_from = "taxon",
-                      values_from = "observed0",
-                      values_fill = list(observed0=pseudocount)) %>%    
-          column_to_rownames("sample_id") %>%
-          as.matrix() 
-        
-        exp_mat <- x %>%
-          dplyr::select(sample_id, taxon, expected)%>%
-          pivot_wider(id_cols= sample_id,
-                      names_from = "taxon",
-                      values_from = "expected",
-                      values_fill = list(expected=0))%>%    
-          column_to_rownames("sample_id") %>%
-          as.matrix() 
-                
-       fit_mc <- estimate_bias(
-          observed = obs_mat,
-          actual = exp_mat, 
-          margin = 1, # samples as rows
-          boot = TRUE
-        ) %>%
-         summary()
-       out <- fit_mc$coefficients
-       return(out)
-        })) %>%
-    unnest(fit) %>%
-  mutate(lower = estimate / gm_se^2, upper = estimate * gm_se^2)
-
-
-# See how well bias estimates fit the data
-preds <- joint %>%
-  left_join(fit_metacal) %>%
-  dplyr::mutate(predicted = expected * estimate) %>%
-  group_by(sample_id, pcr_primers) %>%
-  mutate_at(vars(predicted), ~ . / sum(., na.rm=TRUE) ) %>%
-  filter(expected > 0) %>%
-  filter(observed > 0)
-
-# Get RMSE
-errors <- preds %>%
-  group_by(pcr_primers) %>%
-  rmse(truth = observed, estimate = predicted) %>%
-  dplyr::select(pcr_primers, rmse = .estimate)
-
-gg.bias_fits <- preds %>%
-  mutate(taxon = str_replace(taxon, "_", " ")) %>%
-  left_join(errors) %>%
-  mutate(rmse = paste0("RMSE = ", scales::percent(rmse, 2))) %>%
-  ggplot(aes(x=predicted, y=observed, color = taxon))+
-  geom_abline(intercept = 0, slope = 1, color = "grey") +
-    geom_jitter(width = 0.1, height = 0, alpha=0.7, size=2) +
-  geom_text(aes(x=0.05, y=0.9, label=rmse), check_overlap = TRUE, inherit.aes = FALSE)+
-  facet_wrap(~pcr_primers)+
-  coord_fixed()+
-  scale_color_brewer(palette = "Paired")+
-  scale_x_continuous(trans = scales::pseudo_log_trans(1e-2), labels=scales::percent, breaks=c(0, 0.025, 0.05, 0.1, 0.25, 0.5, 1), limits=c(0,1))+
-  scale_y_continuous(trans = scales::pseudo_log_trans(1e-2), labels=scales::percent, breaks=c(0, 0.025, 0.05, 0.1, 0.25, 0.5, 1), limits=c(0,1))+
+gg.bias_lollipop <- mismatch_joint %>%
+  ggplot(aes(x=gm_mean , y=Species, fill=pred_mismatch))+ 
+  geom_segment(aes(xend=1, yend=Species))+
+  geom_point(size=4, shape=21, colour="black")+
+  geom_text(aes(label=round(log10(gm_mean), 2)), nudge_y = 0.6)+
+  geom_vline(xintercept = 1, colour="black", size=1)  +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  annotation_logticks(sides="b", outside=TRUE) +
   base_theme +
-  theme(
-        panel.spacing.x = unit(1, "lines"),
-        legend.position = "right",
-        legend.text = element_text(face = "italic", size=10)
-    ) +
-   labs(x = "log-odds(Predicted proportion)", 
-     y = "log-odds(Observed proportion)",
-     colour = "Taxon") 
+  theme(#panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle=0, hjust = 0.5, vjust = 1),
+        axis.text.y = element_text(face = "italic", colour =mypal(length(unique(heatmap_dat$Species)))),
+        legend.text = element_text(face="italic")) +
+    facet_grid(pcr_primers~., scales="free_x") +
+  scale_fill_distiller(palette = "RdBu", direction = -1) +
+  labs(y = NULL, 
+       x = "Detection efficiency / geometric mean",
+      level = "Confidence interval",
+      fill = "Primer mismatch")+
+  coord_cartesian(clip = "off") 
 
+gg.bias_fit <- mismatch_joint %>%
+  ggplot(aes(x=scale(gm_mean, center = TRUE, scale = TRUE) , y=scale(pred_mismatch,center = TRUE, scale = TRUE), fill=Species))+ 
+  geom_point(size=3, shape=21, colour="black")+
+  geom_abline(lty = 2, colour = "gray80", size = 1) +
+  base_theme +
+  theme(#panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(angle=0, hjust = 0.5, vjust = 1),
+        axis.text.y = element_text(face = "italic"),
+        legend.text = element_text(face="italic")) +
+    facet_grid(pcr_primers~., scales="free_x") +
+  scale_fill_manual(values= mypal(length(unique(heatmap_dat$Species)))) +
+  #scale_fill_distiller(palette = "RdBu", direction = -1) +
+  labs(y = "Scaled primer mismatch", 
+       x = "Scaled detection efficiency",
+      level = "Confidence interval",
+      fill = "Species")
 
-gg.bias_fits
+# Colour text by species name
 
-# Write out bias explained for supplementary 
-pdf(file="fig/supplementary/bias_model_fit.pdf", width = 8, height = 6 , paper="a4r")
-  plot(gg.bias_fits)
+gg.fig5 <- gg.bias_lollipop - gg.bias_fit
+
+gg.fig5
+
+pdf(file="fig/Fig5_bias.pdf", width = 11, height = 8 , paper="a4r")
+  plot(gg.fig5)
 try(dev.off(), silent=TRUE)
 
-# Plot bias estimates
-gg.bias <- preds %>%
-  ungroup() %>%
-  dplyr::select(taxon, estimate, upper, lower, pcr_primers) %>%
-  distinct()%>%
-  left_join(mock_tree$data %>% dplyr::mutate(taxon = label %>% str_replace(" ", "_")))%>%
-  filter(!is.na(estimate)) %>%
-  mutate(taxon = taxon %>% 
-           str_replace("^Drosophila_", "D. ")%>%
-           str_replace("^Scaptodrosophila_", "Sca. ")) %>%
-  mutate(taxon = factor(taxon))%>%
-  ggplot(aes(x = fct_reorder(taxon, y), y = estimate, colour = pcr_primers, group = pcr_primers)) +
-  geom_hline(yintercept = 1, alpha=0.5, colour = "grey20") +
-  geom_pointrange(aes(ymin = lower, ymax = upper), position=position_dodge(width=0.6))+
-  scale_y_log10()+
-  base_theme+
-  scale_colour_brewer(palette="Paired") +
-  labs(
-    x = NULL,
-    colour="PCR primers",
-    y = "Efficiency / Geometric mean") +
-  theme(axis.text.x = element_text(face = "italic"),
-        legend.position = "bottom")
 
-gg.bias
-
-#bias is missing for BF1 biarmipes because it was under filtering threshold
+## Fit the metacal model to each pcr primer set and community type
+#fit_metacal <- joint %>%
+#  filter(expected > 0, observed > 0) %>%
+#  group_by(pcr_primers)  %>%
+#  nest() %>%
+#    mutate(
+#        fit = purrr::map(data, function(x){
+#        obs_mat <- x %>%
+#          dplyr::select(sample_id, taxon, observed0)%>%
+#          pivot_wider(id_cols= sample_id,
+#                      names_from = "taxon",
+#                      values_from = "observed0",
+#                      values_fill = list(observed0=pseudocount)) %>%    
+#          column_to_rownames("sample_id") %>%
+#          as.matrix() 
+#        
+#        exp_mat <- x %>%
+#          dplyr::select(sample_id, taxon, expected)%>%
+#          pivot_wider(id_cols= sample_id,
+#                      names_from = "taxon",
+#                      values_from = "expected",
+#                      values_fill = list(expected=0))%>%    
+#          column_to_rownames("sample_id") %>%
+#          as.matrix() 
+#                
+#       fit_mc <- estimate_bias(
+#          observed = obs_mat,
+#          actual = exp_mat, 
+#          margin = 1, # samples as rows
+#          boot = TRUE
+#        ) %>%
+#         summary()
+#       out <- fit_mc$coefficients
+#       return(out)
+#        })) %>%
+#    unnest(fit) %>%
+#  mutate(lower = estimate / gm_se^2, upper = estimate * gm_se^2)
+#
+#
+## See how well bias estimates fit the data
+#preds <- joint %>%
+#  left_join(fit_metacal) %>%
+#  dplyr::mutate(predicted = expected * estimate) %>%
+#  group_by(sample_id, pcr_primers) %>%
+#  mutate_at(vars(predicted), ~ . / sum(., na.rm=TRUE) ) %>%
+#  filter(expected > 0) %>%
+#  filter(observed > 0)
+#
+## Get RMSE
+#errors <- preds %>%
+#  group_by(pcr_primers) %>%
+#  rmse(truth = observed, estimate = predicted) %>%
+#  dplyr::select(pcr_primers, rmse = .estimate)
+#
+#gg.bias_fits <- preds %>%
+#  mutate(taxon = str_replace(taxon, "_", " ")) %>%
+#  left_join(errors) %>%
+#  mutate(rmse = paste0("RMSE = ", scales::percent(rmse, 2))) %>%
+#  ggplot(aes(x=predicted, y=observed, color = taxon))+
+#  geom_abline(intercept = 0, slope = 1, color = "grey") +
+#    geom_jitter(width = 0.1, height = 0, alpha=0.7, size=2) +
+#  geom_text(aes(x=0.05, y=0.9, label=rmse), check_overlap = TRUE, inherit.aes = FALSE)+
+#  facet_wrap(~pcr_primers)+
+#  coord_fixed()+
+#  scale_color_brewer(palette = "Paired")+
+#  scale_x_continuous(trans = scales::pseudo_log_trans(1e-2), labels=scales::percent, breaks=c(0, 0.025, #0.05, 0.1, 0.25, 0.5, 1), limits=c(0,1))+
+#  scale_y_continuous(trans = scales::pseudo_log_trans(1e-2), labels=scales::percent, breaks=c(0, 0.025, #0.05, 0.1, 0.25, 0.5, 1), limits=c(0,1))+
+#  base_theme +
+#  theme(
+#        panel.spacing.x = unit(1, "lines"),
+#        legend.position = "right",
+#        legend.text = element_text(face = "italic", size=10)
+#    ) +
+#   labs(x = "log-odds(Predicted proportion)", 
+#     y = "log-odds(Observed proportion)",
+#     colour = "Taxon") 
+#
+#
+#gg.bias_fits
+#
+## Write out bias explained for supplementary 
+#pdf(file="fig/supplementary/bias_model_fit.pdf", width = 8, height = 6 , paper="a4r")
+#  plot(gg.bias_fits)
+#try(dev.off(), silent=TRUE)
+#
+## Plot bias estimates
+#gg.bias <- preds %>%
+#  ungroup() %>%
+#  dplyr::select(taxon, estimate, upper, lower, pcr_primers) %>%
+#  distinct()%>%
+#  left_join(mock_tree$data %>% dplyr::mutate(taxon = label %>% str_replace(" ", "_")))%>%
+#  filter(!is.na(estimate)) %>%
+#  mutate(taxon = taxon %>% 
+#           str_replace("^Drosophila_", "D. ")%>%
+#           str_replace("^Scaptodrosophila_", "Sca. ")) %>%
+#  mutate(taxon = factor(taxon))%>%
+#  ggplot(aes(x = fct_reorder(taxon, y), y = estimate, colour = pcr_primers, group = pcr_primers)) +
+#  geom_hline(yintercept = 1, alpha=0.5, colour = "grey20") +
+#  geom_pointrange(aes(ymin = lower, ymax = upper), position=position_dodge(width=0.6))+
+#  scale_y_log10()+
+#  base_theme+
+#  scale_colour_brewer(palette="Paired") +
+#  labs(
+#    x = NULL,
+#    colour="PCR primers",
+#    y = "Efficiency / Geometric mean") +
+#  theme(axis.text.x = element_text(face = "italic"),
+#        legend.position = "bottom")
+#
+#gg.bias
+#
+##bias is missing for BF1 biarmipes because it was under filtering threshold
 
 ```
 
