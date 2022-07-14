@@ -59,7 +59,7 @@ dos2unix $samplesheet
 bcl2fastq -p 12 --runfolder-dir $inputdir \
 --output-dir $outputdir \
 --sample-sheet $samplesheet \
---no-lane-splitting --barcode-mismatches 1
+--no-lane-splitting --barcode-mismatches 0
 
 # Copy other necessary files and move fastqs
 cd $outputdir
@@ -81,6 +81,78 @@ for i in *.fastq.gz; do
   fi
 done
 
+
+###Run2
+
+#Set up input and outputs
+inputdir=/group/sequencing/220523_M03633_0591_000000000-K739J #CHANGE TO YOUR SEQ RUN
+outputdir=/group/pathogens/Alexp/Metabarcoding/tephritid_metabarcoding/data/K739J #CHANGE TO YOUR DATA FOLDER RUN
+samplesheet=/group/pathogens/Alexp/Metabarcoding/tephritid_metabarcoding/data/K739J/SampleSheet_K739J.csv #CHANGE TO YOUR SAMPLESHEET
+
+# convert samplesheet to unix format
+dos2unix $samplesheet
+
+#Demultiplex
+bcl2fastq -p 12 --runfolder-dir $inputdir \
+--output-dir $outputdir \
+--sample-sheet $samplesheet \
+--no-lane-splitting --barcode-mismatches 0
+
+# Copy other necessary files and move fastqs
+cd $outputdir
+cp -r $inputdir/InterOp $outputdir
+cp $inputdir/RunInfo.xml $outputdir
+cp $inputdir/runInfo.xml $outputdir
+cp $inputdir/runParameters.xml $outputdir
+cp $inputdir/RunParameters.xml $outputdir
+cp $samplesheet $outputdir
+mv **/*.fastq.gz $outputdir
+
+# Append fcid to start of sample names if missing
+fcid=$(echo $inputdir | sed 's/^.*-//')
+for i in *.fastq.gz; do
+  if ! [[ $i == $fcid* ]]; then
+  new=$(echo ${fcid} ${i}) #append together
+  new=$(echo ${new// /_}) #remove any whitespace
+  mv -v "$i" "$new"
+  fi
+done
+
+###Run3 
+
+#Set up input and outputs
+inputdir=/group/sequencing/220527_M01054_0780_000000000-K77JP #CHANGE TO YOUR SEQ RUN
+outputdir=/group/pathogens/Alexp/Metabarcoding/tephritid_metabarcoding/data/K77JP #CHANGE TO YOUR DATA FOLDER RUN
+samplesheet=/group/pathogens/Alexp/Metabarcoding/tephritid_metabarcoding/data/K77JP/SampleSheet_K77JP.csv #CHANGE TO YOUR SAMPLESHEET
+
+# convert samplesheet to unix format
+dos2unix $samplesheet
+
+#Demultiplex
+bcl2fastq -p 12 --runfolder-dir $inputdir \
+--output-dir $outputdir \
+--sample-sheet $samplesheet \
+--no-lane-splitting --barcode-mismatches 0
+
+# Copy other necessary files and move fastqs
+cd $outputdir
+cp -r $inputdir/InterOp $outputdir
+cp $inputdir/RunInfo.xml $outputdir
+cp $inputdir/runInfo.xml $outputdir
+cp $inputdir/runParameters.xml $outputdir
+cp $inputdir/RunParameters.xml $outputdir
+cp $samplesheet $outputdir
+mv **/*.fastq.gz $outputdir
+
+# Append fcid to start of sample names if missing
+fcid=$(echo $inputdir | sed 's/^.*-//')
+for i in *.fastq.gz; do
+  if ! [[ $i == $fcid* ]]; then
+  new=$(echo ${fcid} ${i}) #append together
+  new=$(echo ${new// /_}) #remove any whitespace
+  mv -v "$i" "$new"
+  fi
+done
 ```
 
 # Optional: Run R on BASC
@@ -181,20 +253,11 @@ if(Sys.which("fastqc") == "" & !file.exists("bin/FastQC/fastqc")){
 #  taxreturn::blast_install(dest_dir = "bin")
 #}
 
-# Create directories
-if(!dir.exists("data")){dir.create("data", recursive = TRUE)}
-if(!dir.exists("reference")){dir.create("reference", recursive = TRUE)}
-if(!dir.exists("output/logs")){dir.create("output/logs", recursive = TRUE)}
-if(!dir.exists("output/results")){dir.create("output/results", recursive = TRUE)}
-if(!dir.exists("output/rds")){dir.create("output/rds", recursive = TRUE)}
-if(!dir.exists("sample_data")){dir.create("sample_data", recursive = TRUE)}
-if(!dir.exists("output/results/final")) {dir.create("output/results/final", recursive = TRUE)}
-if(!dir.exists("output/results/unfiltered")) {dir.create("output/results/unfiltered", recursive = TRUE)}
-if(!dir.exists("output/results/filtered")) {dir.create("output/results/filtered", recursive = TRUE)}
 
 
 source("R/dependencies.R")
 source("R/functions.R")
+source("R/themes.R")
 ```
 
 # Create sample sheet 
@@ -230,26 +293,8 @@ runParameters <- list.files(paste0("data/", runs), pattern= "[Rr]unParameters.xm
 samdf <- create_samplesheet(SampleSheet = SampleSheet, runParameters = runParameters, template = "V4") %>%
   distinct()
 
-# Merge in existing sample_info metadata file if you have one
-sample_info <- readxl::read_excel("sample_data/sample_infoV4.xlsx", sheet="SAMPLESHEET")
-samdf <- coalesce_join(samdf, sample_info, by="sample_id")
-
-# Create logfile containing samples and run parameters for all runs
-logdf <- create_logsheet(SampleSheet = SampleSheet, runParameters = runParameters) %>%
-  distinct()
-
-#Check logdf and samdf are the same length
-if(!nrow(samdf) == nrow(logdf)){
-  warning("Samdf and logdf do not contain the same number of rows!")
-}
-
 # Check if sampleids contain fcid, if not; attatch
 samdf <- samdf %>%
-  mutate(sample_id = case_when(
-    !str_detect(sample_id, fcid) ~ paste0(fcid,"_",sample_id),
-    TRUE ~ sample_id
-  ))
-logdf <- logdf %>%
   mutate(sample_id = case_when(
     !str_detect(sample_id, fcid) ~ paste0(fcid,"_",sample_id),
     TRUE ~ sample_id
@@ -277,27 +322,39 @@ if (length(setdiff(samdf$sample_id, fastqFs)) > 0) {
     filter(!sample_id %in% setdiff(logdf$sample_id, fastqFs))
 }
 
-# Add primer sequences
-
+# Create demuxed samplesheet
 samdf <- samdf %>%
   mutate(pcr_primers = case_when(
     str_detect(sample_id, "_fwh")  ~ "fwhF2-fwhR2nDac",
-    str_detect(sample_id, "_EIF")  ~ "EIF3LminiF4-EIF3lminiR4"
+    str_detect(sample_id, "_EIF")  ~ "EIF3LminiF4-EIF3lminiR4",
+    TRUE ~ "fwhF2-fwhR2nDac;EIF3LminiF4-EIF3lminiR4",
   ),
   for_primer_seq = case_when(
     str_detect(sample_id, "_fwh")  ~ "GGDACWGGWTGAACWGTWTAYCCHCC",
-    str_detect(sample_id, "_EIF")  ~ "GATGCGYCGTTATGCYGATGC"
+    str_detect(sample_id, "_EIF")  ~ "GATGCGYCGTTATGCYGATGC",
+    TRUE ~ "GGDACWGGWTGAACWGTWTAYCCHCC;GATGCGYCGTTATGCYGATGC"
   ),
   rev_primer_seq = case_when(
     str_detect(sample_id, "_fwh")  ~ "GTRATWGCHCCIGCTAADACHGG",
-    str_detect(sample_id, "_EIF")  ~ "TTRAAYACTTCYARATCRCC"    
-  )
-  )
+    str_detect(sample_id, "_EIF")  ~ "TTRAAYACTTCYARATCRCC",
+    TRUE ~ "GTRATWGCHCCIGCTAADACHGG;TTRAAYACTTCYARATCRCC"
+  ))
+
+# Params to add in step_add_parameters
+params <- tibble(
+  pcr_primers = c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"),
+  target_gene=c("COI", "EIF3L"),
+  phmm = c("diagnostic_alignments/model/Bactrocera_COI.rds", "diagnostic_alignments/model/Bactrocera_EIF3L.rds"),
+  ref_db = c("reference/COI_idtaxa.rds","reference/EIF3L_idtaxa.rds"),
+  blast_db = c("reference/COI_hierarchial.fa", "reference/EIF3L_hierarchial.fa"),
+  exp_length = c(205, 217),
+  genetic_code = c("SGC4", "SGC0"),
+  coding = c(TRUE, TRUE)
+)
 
 #Write out updated sample CSV for use
 write_csv(samdf, "sample_data/Sample_info.csv")
-write_csv(logdf, "output/logs/logdf.csv")
-
+write_csv(params, "sample_data/loci_params.csv")
 ```
 
 
@@ -344,7 +401,9 @@ If multiple primers have been multiplexed per library, use the multiplexed prime
 # Could still group by fcid for the per-sample, but then calculate within that.
 # Perhaps a set_trunclen parameter that adds an extra column?
 
-test2 <- test %>%
+test2 <- samdf %>%
+  filter(fcid== "K77JP") %>%
+  dplyr::slice(1:3) %>%
   ungroup() %>%
   mutate(
    # Primer trimming
@@ -372,7 +431,7 @@ test2 <- test %>%
                           input_dir = paste0("data/",..2,"/02_filtered/"), truncLen=NULL, quiet = FALSE)
     ))
 
-# Write out quality plots - Could just combine with the aboce using a pwalk call?
+# Write out quality plots 
 test2 %>%
   group_by(fcid) %>%
   nest() %>%
@@ -386,6 +445,26 @@ test2 %>%
     try(dev.off(), silent=TRUE)
     })
 
+# Plot read numbers
+gg.read_counts <- test2 %>%
+  dplyr::select(sample_id, sample_name, primer_trim,fcid) %>%
+  unnest(primer_trim) %>%
+  mutate(primer_name = case_when(
+    for_primer_seq == "GGDACWGGWTGAACWGTWTAYCCHCC" ~ "COI",
+    for_primer_seq == "GATGCGYCGTTATGCYGATGC" ~ "EIF3L"
+  ),
+  group=case_when(
+    str_detect(sample_id, "Diego") ~ "Diego",
+    str_detect(sample_id, "Mock") ~ "Mock",
+    str_detect(sample_id, "Trap") ~ "Trap",
+    TRUE ~ "Trap"
+  )) %>%
+  ggplot(aes(x = sample_name, y = trimmed_output, fill=primer_name))+
+  geom_col(position = "dodge")+
+  facet_grid(fcid~group, drop=TRUE, scales="free_x", space="free_x") +
+  base_theme + 
+  theme(legend.position = "right")
+
 
 ```
 
@@ -395,9 +474,10 @@ This workflow uses the DADA2 algorithm to differentiate real sequences from erro
 
 
 ```{r}
+samdf <- read.csv("sample_data/Sample_info.csv", stringsAsFactors = FALSE)
 
 # RUn DADA2
-test3 <- test2 %>%
+test3 <- samdf %>%
   group_by(fcid) %>%
   nest() %>%
   mutate(dada2 = purrr::pmap(dplyr::select(., fcid),
@@ -407,6 +487,11 @@ test3 <- test2 %>%
                     qc_dir = paste0("output/logs/",..1),
                     quiet = FALSE)
    ))
+
+#Error in `mutate()`:
+#! Problem while computing `dada2 = purrr::pmap(...)`.
+#x `dada2` must be size 1, not 3.
+#i
 
 ```
 
@@ -424,33 +509,7 @@ Note: this will change if you are using a coding marker or not
 
 # Add an stop point if all samples have remvoved
 
-test4 <- test3 %>%
-  unnest(data) %>%
-  mutate(target_gene = case_when(
-    str_detect(pcr_primers, "fwh") ~ "fwh",
-    str_detect(pcr_primers, "EIF") ~ "EIF"
-  ))  %>%
-  mutate(phmm = case_when(
-    str_detect(pcr_primers, "fwh") ~  "diagnostic_alignments/model/Bactrocera_COI.rds",
-    str_detect(pcr_primers, "EIF") ~"diagnostic_alignments/model/Bactrocera_EIF3L.rds"
-  ))%>%
-  mutate(ref_db = case_when(
-    str_detect(pcr_primers, "fwh") ~ "reference/COI_idtaxa.rds",
-    str_detect(pcr_primers, "EIF") ~ "reference/EIF3L_idtaxa.rds"
-  ))%>%
-  mutate(blast_db = case_when(
-    str_detect(pcr_primers, "fwh") ~ "reference/COI_hierarchial.fa",
-    str_detect(pcr_primers, "EIF") ~ "reference/EIF3L_hierarchial.fa"
-  ))%>%
-  mutate(exp_length = case_when(
-    str_detect(pcr_primers, "fwh") ~  205,
-    str_detect(pcr_primers, "EIF") ~ 217
-  )) %>%
-  mutate(genetic_code = case_when(
-    str_detect(pcr_primers, "fwh") ~  "SGC4",
-    str_detect(pcr_primers, "EIF") ~ "SGC0"
-  )) %>%
-  mutate( coding=TRUE) %>%
+test4 <- samdf %>%
   ungroup() %>%
   group_by(target_gene) %>%
   nest() %>%
@@ -954,7 +1013,4 @@ pdf(paste0("output/logs/read_tracker_separate.pdf"), width = 11, height = 8 , pa
 try(dev.off(), silent=TRUE)
 ```
 
-# Further analysis
-
-From here, the dataset can be further analysed in software of your choice. I suggest the use of [phyloseq](https://joey711.github.io/phyloseq/) 
 

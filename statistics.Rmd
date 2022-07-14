@@ -96,35 +96,44 @@ ps1 <- readRDS("output/rds/ps_filtered.rds")
 #  "CK-01-ME_2020-11-16"
 #)
 
-# Flip samples 6 and 7, and 2 and 5
-trap_names <- c(
-  "CN-13-CUE_2021-01-25",
-    "BRP-08-CUE_2020-09-28",
-  "CN-13-CUE_2020-11-04",
-  "CN-15-CUE_2020-11-17",
-  "BRP-01-CUE_2020-09-28",
-  "CN-15-CUE_2021-01-12",
-  "CN-13-CUE_2020-11-17",
-  "CN-16-CUE_2020-10-20",
-  "CN-15-CUE_2020-09-09",
-  "MT-01-ME_2021-01-02",
-  "CK-01-ME_2020-11-16"
-)
+## Flip samples 6 and 7, and 2 and 5
+#trap_names <- c(
+#  "CN-13-CUE_2021-01-25",
+#  "BRP-08-CUE_2020-09-28",
+#  "CN-13-CUE_2020-11-04",
+#  "CN-15-CUE_2020-11-17",
+#  "BRP-01-CUE_2020-09-28",
+#  "CN-15-CUE_2021-01-12",
+#  "CN-13-CUE_2020-11-17",
+#  "CN-16-CUE_2020-10-20",
+#  "CN-15-CUE_2020-09-09",
+#  "MT-01-ME_2021-01-02",
+#  "CK-01-ME_2020-11-16"
+#)
+#
+## Update sample info
+#sample_data(ps1) <- sample_data(ps1)  %>%
+#  as("data.frame") %>%
+#  as_tibble(rownames=".sample") %>%
+#  #dplyr::select(-.sample)%>%
+#  mutate(sample_name = sample_name %>% str_remove("_.*$")) %>%
+#  left_join(
+#    cbind(paste0("T", seq(1,11,1)), trap_names) %>%
+#  as.data.frame() %>%
+#  magrittr::set_colnames(c("sample_name", "new_sample_name"))
+#  ) %>%
+#  mutate(sample_name = new_sample_name) %>%
+#  dplyr::select(-new_sample_name) %>%
+#  tibble::column_to_rownames(".sample")
 
-# Update sample info
-sample_data(ps1) <- sample_data(ps1)  %>%
-  as("data.frame") %>%
-  as_tibble(rownames=".sample") %>%
-  #dplyr::select(-.sample)%>%
-  mutate(sample_name = sample_name %>% str_remove("_.*$")) %>%
-  left_join(
-    cbind(paste0("T", seq(1,11,1)), trap_names) %>%
-  as.data.frame() %>%
-  magrittr::set_colnames(c("sample_name", "new_sample_name"))
-  ) %>%
-  mutate(sample_name = new_sample_name) %>%
-  dplyr::select(-new_sample_name) %>%
-  tibble::column_to_rownames(".sample")
+
+# sample orders for plots
+trap_orders <- c(
+  paste0("Mock", seq(1,16,1)),
+  paste0("T",seq(1,11,1)), # First Traps
+  paste0("Trap", seq(1,39,1)),
+  paste0("Diego", seq(1,10,1))
+ )
 
 
 ```
@@ -143,12 +152,12 @@ summary_dat <- ps1 %>%
 # Plot reads per sample
 
 gg.read_abundance <- summary_dat %>%
-  group_by(sample_id, sample_name, pcr_primers) %>%
+  group_by(fcid, sample_name, pcr_primers) %>%
   summarise(abundance = sum(Abundance)) %>%
-  mutate(sample_name = factor(sample_name, levels = trap_names),
-         pcr_primers = factor(pcr_primers, levels=c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
+#  mutate(sample_name = factor(sample_name, levels = trap_names),
+ #        pcr_primers = factor(pcr_primers, levels=c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
   ggplot(aes(x = sample_name, y = abundance, group=pcr_primers, fill=pcr_primers))+
-  #facet_grid(pcr_primers~.)+
+  facet_grid(fcid~.)+
   geom_col(position="dodge") + 
   base_theme +
   theme(legend.position = "top")+
@@ -216,11 +225,13 @@ id_success <- bind_rows(
 # LOad in expected composition
 exp_composition <- bind_rows(
     read_csv("sample_data/expected_quant.csv") %>%
+      dplyr::select(-trap_code) %>%
       pivot_longer(-sample_name,
                    names_to= "Species",
                    values_to= "expected")%>% 
       mutate(pcr_primers = "fwhF2-fwhR2nDac"),
     read_csv("sample_data/expected_quant.csv") %>%
+        dplyr::select(-trap_code) %>%
         pivot_longer(-sample_name,
                      names_to= "Species",
                      values_to= "expected")%>% 
@@ -263,7 +274,7 @@ exp_composition <- bind_rows(
     str_detect(Species, "mayi|tenuifascia") ~ "Bactrocera mayi/tenuifascia",
     str_detect(Species, "albistrigata|frauenfeldi|kirki|fagraea|psidii") ~ "Bactrocera albistrigata/frauenfeldi/kirki/psidii",
     str_detect(Species, "cacuminata|makilingensis|commensurata") ~ "Bactrocera opiliae",
-    str_detect(Species, "yorkensis|breviaculeus|rufofuscula|carbonaria") ~ "Bactrocera breviaculeus/peninsularis/rufofuscula",
+    str_detect(Species, "yorkensis|breviaculeus|rufofuscula|carbonaria|peninsularis") ~ "Bactrocera breviaculeus/peninsularis/rufofuscula",
     #pcr_primers == "EIF3LminiF4-EIF3lminiR4"& str_detect(Species, "~ 
     TRUE ~ Species
   )) %>%
@@ -273,9 +284,72 @@ exp_composition <- bind_rows(
   ungroup() 
 
 
+# Rough heatmap
+gg.heatmap_unresolved <- ps1 %>%
+  speedyseq::psmelt() %>%
+  filter(Abundance > 0) %>%
+   mutate(sample_name = sample_id %>%
+            str_remove(fcid) %>%
+            str_remove(pcr_primers) %>%
+            str_remove("^_") %>%
+            str_remove("_$"))%>%
+      mutate(sample_name = sample_name %>% str_remove("_EIF|_fwh")) %>%
+     group_by(sample_name, pcr_primers) %>%
+  mutate_at(vars(Abundance), ~ . / sum(.) ) %>%
+  mutate(Species = factor(Species),
+         sample_name = factor(sample_name, levels= trap_orders),
+         pcr_primers = factor(pcr_primers, levels= c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
+   ggplot(aes(x=sample_name, y=Species, fill=Abundance)) +
+    geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent, na.value = NA, alpha=0.9) +
+  scale_y_discrete(limits=rev)+
+  base_theme+
+  theme(legend.position = "right",
+        axis.text.y = element_text(face="italic"),
+        axis.title.y = element_blank())+
+    labs(x="Sample",
+         y="Taxon") +
+  facet_grid(~pcr_primers, drop=TRUE)
+
+gg.heatmap_unresolved
+
+pdf(file="fig/Fig4_rough_heatmap.pdf", width = 11, height = 8 , paper="a4r")
+  plot(gg.heatmap_unresolved)
+try(dev.off(), silent=TRUE)
+
+# Read in a list of taxa contrained in reference database 
+database_seqs <- bind_rows(
+  names(insect::readFASTA("reference/COI_hierarchial.fa")) %>%
+    str_remove("^.*;") %>%
+    tibble::enframe(name=NULL, value="Species") %>%
+    group_by(Species) %>%
+    summarise(seqs = n()) %>%
+    mutate(pcr_primers = "fwhF2-fwhR2nDac"),
+  names(insect::readFASTA("reference/EIF3L_hierarchial.fa")) %>%
+    str_remove("^.*;") %>%
+    tibble::enframe(name=NULL, value="Species") %>%
+    group_by(Species) %>%
+    summarise(seqs = n()) %>%
+    mutate(pcr_primers = "EIF3LminiF4-EIF3lminiR4")
+) %>%
+  group_by(Species, pcr_primers) %>%
+  summarise(seqs = sum(seqs, na.rm = TRUE)) %>%
+  mutate(spp_only = Species %>% str_remove("^.* "))
+
+
+database_seqs %>% 
+  filter(str_detect(Species, "Dacus|Zeugodacus|Bactrocera")) %>%
+  group_by(pcr_primers) %>%
+  summarise(n_spp = n_distinct(Species), n_seqs = sum(seqs))
+
 # Heatmap separate for primers
 heatmap_dat <-  ps1 %>%
   speedyseq::psmelt() %>%
+  mutate(sample_name = sample_name %>% str_remove("_EIF|_fwh")) %>% 
+  mutate(sample_name = sample_name %>%
+           str_replace("^T2$", "T5new")%>% # Fix mixed up samples
+           str_replace("^T5$", "T2new") %>%
+           str_remove("new")) %>%
   filter(Abundance > 0) %>% 
     mutate(species_new = purrr::map2(Species, pcr_primers, ~{
     id_success_loci <- id_success %>% 
@@ -314,7 +388,8 @@ heatmap_dat <-  ps1 %>%
     str_detect(Species, "mayi|tenuifascia") ~ "Bactrocera mayi/tenuifascia",
     str_detect(Species, "albistrigata|frauenfeldi|kirki|fagraea|psidii") ~ "Bactrocera albistrigata/frauenfeldi/kirki/psidii",
     str_detect(Species, "cacuminata|makilingensis|commensurata") ~ "Bactrocera opiliae",
-    str_detect(Species, "yorkensis|breviaculeus|rufofuscula|carbonaria") ~ "Bactrocera breviaculeus/peninsularis/rufofuscula",
+    str_detect(Species, "yorkensis|breviaculeus|rufofuscula|carbonaria|peninsularis") ~ "Bactrocera breviaculeus/peninsularis/rufofuscula",
+    str_detect(Species, "Zeugodacus univittatus") ~ "Zeugodacus strigifinis",    
     #pcr_primers == "EIF3LminiF4-EIF3lminiR4"& str_detect(Species, "~ 
     TRUE ~ Species
   )) %>%
@@ -323,20 +398,37 @@ heatmap_dat <-  ps1 %>%
   group_by(sample_id, sample_name, pcr_primers, Species) %>%
   summarise(Abundance = sum(Abundance)) %>%
   ungroup() %>%
-  group_by(sample_id, pcr_primers) %>%
+  group_by(sample_name, pcr_primers) %>%
   mutate_at(vars(Abundance), ~ . / sum(.) ) %>%
   ungroup() %>%
-    filter(Abundance > 1e-04) %>%
   full_join(exp_composition, by = c("sample_name","Species", "pcr_primers")) %>%
-  mutate(expected = replace_na(expected, 0)) %>%
+  mutate(expected = replace_na(expected, 0))  %>%
+  mutate(db_seqs = purrr::map2_int(Species, pcr_primers, ~{
+    matchlist <- database_seqs %>% filter(pcr_primers == .y)
+    to_match <- .x %>% str_remove("^.* ") %>% str_split("/") %>% unlist() %>% sort() %>% unique()
+    sum(matchlist$seqs[match(to_match, matchlist$spp_only)], na.rm = TRUE)
+  }))  %>%
   mutate(outcome = case_when(
     Abundance > 0 & expected == 0 ~ "FP",
     Abundance > 0 & expected > 0 ~ "TP",
-    is.na(Abundance) & expected > 0 ~ "FN"
+    is.na(Abundance) & expected > 0 & db_seqs > 0 ~ "FN",
+    is.na(Abundance) & expected > 0 & db_seqs == 0 ~ "Absent from DB"
   ))  %>%
   group_by(Species, pcr_primers) %>%
   mutate(prev = n_distinct(sample_name)) %>%
   filter(!(is.na(Abundance) & is.na(outcome)))
+
+# N species per primer
+heatmap_dat %>%
+  mutate(mixed = str_detect(Species, "/")) %>%
+  group_by(pcr_primers, mixed)%>%
+  summarise(n_spp = n_distinct(Species))
+
+# N species combined
+heatmap_dat %>%
+  mutate(mixed = str_detect(Species, "/")) %>%
+  group_by(mixed)%>%
+  summarise(n_spp = n_distinct(Species))
 
 #Taxa that were different across primers
 heatmap_dat %>%
@@ -352,17 +444,20 @@ heatmap_dat %>%
 heatmap_dat %>%
   filter(!is.na(outcome)) %>%
   group_by(outcome, pcr_primers) %>%
-  summarise(unique = n_distinct(Species)) 
+  summarise(unique = n_distinct(Species))
 
-gg.filt_heatmap <- heatmap_dat %>%
+
+gg.unfilt_heatmap <- heatmap_dat %>%
   mutate(Species = factor(Species),
-         sample_name = factor(sample_name, levels= trap_names)) %>%
+         sample_name = factor(sample_name, levels= trap_orders),
+         pcr_primers = factor(pcr_primers, levels= c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
     ggplot(aes(x=sample_name, y=Species, fill=Abundance)) +
     geom_tile() +
   scale_fill_viridis_c(labels = scales::percent, na.value = NA, alpha=0.9) +
   new_scale_fill() +
   geom_tile(aes(fill = outcome))+
-  scale_fill_manual(values=c("FP" = "#e41a1c", "FN"= "grey60"), na.value = NA) +
+  scale_y_discrete(limits=rev)+
+  scale_fill_manual(values=c("FP" = "#e41a1c", "FN"= "grey60", "Absent from DB" = "orange"), na.value = NA) +
   base_theme+
   theme(legend.position = "right",
         axis.text.y = element_text(face="italic"),
@@ -371,16 +466,129 @@ gg.filt_heatmap <- heatmap_dat %>%
          y="Taxon") +
   facet_grid(~pcr_primers, drop=TRUE)
 
+gg.unfilt_heatmap
+
+
+pdf(file="fig/Fig4_unfilt_heatmap.pdf", width = 11, height = 8 , paper="a4r")
+  plot(gg.unfilt_heatmap)
+try(dev.off(), silent=TRUE)
+  
+
+gg.filt_heatmap <- heatmap_dat %>%
+  dplyr::filter(!str_detect(sample_name, "Mock|Diego"))%>%
+  mutate(Species = Species %>% 
+           str_replace("Bactrocera", "B.") %>%
+           str_replace("Dacus", "D.") %>%
+           str_replace("Zeugodacus", "Z."),
+         sample_name = factor(sample_name, levels= trap_orders),
+         pcr_primers = factor(pcr_primers, levels= c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
+  mutate(above_filter = case_when(
+    outcome == "TP" & Abundance > 1e-4 ~ TRUE,
+    outcome == "FP" & Abundance > 1e-4 ~ TRUE,
+    outcome == "FN" ~ TRUE,
+    TRUE ~ FALSE
+  ))%>%
+  filter(above_filter) %>% 
+    ggplot(aes(x=sample_name, y=Species, fill=Abundance)) +
+    geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent, na.value = NA, alpha=0.9) +
+  new_scale_fill() +
+  geom_tile(aes(fill = outcome))+
+  scale_y_discrete(limits=rev)+
+  scale_fill_manual(values=c("FP" = "#e41a1c", "FN"= "grey60", "Absent from DB" = "orange"), na.value = NA) +
+  base_theme+
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(face="italic"),
+        axis.title.y = element_blank())+
+    labs(x="Trap Sample",
+         y="Taxon") +
+  facet_grid(~pcr_primers, drop=TRUE)
+
 gg.filt_heatmap
 
 
-# Add a combined column
+# Extra false positives:
+# B. Halfordiae
+# B. Quasiinfulats
 
-pdf(file="fig/filt_heatmap.pdf", width = 11, height = 8 , paper="a4r")
+# NEed to annotate whats in reference database
+
+
+pdf(file="fig/Fig4_filt_heatmap.pdf", width = 12, height = 8, paper="a4r")
   plot(gg.filt_heatmap)
 try(dev.off(), silent=TRUE)
   
-# Plot of RA vs 
+  
+  
+gg.filt_heatmap_unannnotated <- heatmap_dat %>%
+  dplyr::filter(!str_detect(sample_name, "Mock|Diego"))%>%
+  mutate(Species = Species %>% 
+           str_replace("Bactrocera", "B.") %>%
+           str_replace("Dacus", "D.") %>%
+           str_replace("Zeugodacus", "Z."),
+         sample_name = factor(sample_name, levels= trap_orders),
+         pcr_primers = factor(pcr_primers, levels= c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
+  mutate(above_filter = case_when(
+    outcome == "TP" & Abundance > 1e-4 ~ TRUE,
+    outcome == "FP" & Abundance > 1e-4 ~ TRUE,
+    outcome == "FN" ~ TRUE,
+    TRUE ~ FALSE
+  ))%>%
+  filter(above_filter) %>% 
+    ggplot(aes(x=sample_name, y=Species, fill=Abundance)) +
+    geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent, na.value = NA, alpha=0.9) +
+  #new_scale_fill() +
+  #geom_tile(aes(fill = outcome))+
+  scale_y_discrete(limits=rev)+
+  #scale_fill_manual(values=c("FP" = "#e41a1c", "FN"= "grey60", "Absent from DB" = "orange"), na.value = NA) +
+  base_theme+
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(face="italic"),
+        axis.title.y = element_blank())+
+    labs(x="Trap Sample",
+         y="Taxon") +
+  facet_grid(~pcr_primers, drop=TRUE)
+
+gg.filt_heatmap_unannnotated
+
+
+gg.filt_heatmap_target <- heatmap_dat %>%
+  dplyr::filter(!str_detect(sample_name, "Mock|Diego"))%>%
+  dplyr::filter(sample_name %in% c("T10", "T11")) %>%
+  mutate(Species = Species %>% 
+           str_replace("Bactrocera", "B.") %>%
+           str_replace("Dacus", "D.") %>%
+           str_replace("Zeugodacus", "Z."),
+         sample_name = factor(sample_name, levels= trap_orders),
+         pcr_primers = factor(pcr_primers, levels= c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
+  mutate(above_filter = case_when(
+    outcome == "TP" & Abundance > 1e-4 ~ TRUE,
+    outcome == "FP" & Abundance > 1e-4 ~ TRUE,
+    outcome == "FN" ~ TRUE,
+    TRUE ~ FALSE
+  ))%>%
+  filter(above_filter) %>% 
+    ggplot(aes(x=sample_name, y=Species)) +
+  #  geom_tile() +
+  #scale_fill_viridis_c(labels = scales::percent, na.value = NA, alpha=0.9) +
+  #new_scale_fill() +
+  geom_tile(aes(fill = outcome), alpha=0.8)+
+  scale_y_discrete(limits=rev)+
+  scale_fill_manual(values=c("FP" = "#e41a1c", "FN"= "grey60", "TP" = "#00BA38"), na.value = NA) +
+  base_theme+
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(face="italic"),
+        axis.title.y = element_blank())+
+    labs(x="Trap Sample",
+         y="Taxon",
+         fill = "Agreement") +
+  facet_grid(~pcr_primers, drop=TRUE)
+
+gg.filt_heatmap_target
+
+  
+# Plot of RA vs false positives
 fp_plotdat <- heatmap_dat %>%
   filter(!outcome == "FN") %>%
   mutate(outcome = outcome %>%
@@ -405,6 +613,182 @@ gg.fp_plot
 pdf(file="fig/fp_abundance.pdf", width = 11, height = 8 , paper="a4r")
   plot(gg.fp_plot)
 try(dev.off(), silent=TRUE)
+  
+```
+
+# Sensitivity
+
+
+```{R Sensitivity experiment}
+
+# Subset to just mocks
+#ps_mocks <- subset_samples(ps1, str_detect(sample_name, "Mock"))
+#ps_mocks <- subset_samples(ps1, str_detect(sample_name, "Mock|Diego"))
+
+
+# Plot mocks only
+sens_dat <- heatmap_dat %>%
+  filter(!str_detect(Species, "Damaged")) %>%
+  filter(str_detect(sample_name, "Mock")) %>%
+  #1filter(str_detect(sample_name, "Mock|Diego")) %>%
+  mutate(#Species = factor(Species),
+         sample_name = factor(sample_name, levels= trap_orders),
+         pcr_primers = factor(pcr_primers, levels= c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
+  mutate(comm_size = case_when(
+    sample_name %in% paste0("Mock", seq(1,4,1)) ~ "1:250 Ind",
+    sample_name %in% paste0("Mock", seq(5,8,1)) ~ "1:500 Ind",
+    sample_name %in% paste0("Mock", seq(9,12,1)) ~ "1:1000 Ind",
+    sample_name %in% paste0("Mock", seq(13,16,1)) ~ "1:2000 Ind",
+    str_detect(sample_name,"Diego") ~ "499:615 Ind"
+  ),
+  comm_size=factor(comm_size, levels=c("1:250 Ind", "1:500 Ind", "1:1000 Ind", "1:2000 Ind", "499:615 Ind"))
+  ) 
+
+gg.sens_heatmap <- sens_dat %>%
+  mutate(to_filter = case_when(
+    str_detect(Species, "tryoni") ~ TRUE,
+    pcr_primers == "EIF3LminiF4-EIF3lminiR4" & str_detect(Species, "Dirioxa") ~ TRUE,
+    TRUE ~ FALSE
+  )) %>%
+  dplyr::filter(!to_filter)%>%
+  mutate(Species = factor(Species, levels=c(
+    "Bactrocera jarvisi",
+    "Bactrocera kraussi",
+    "Zeugodacus cucumis",
+    "Dirioxa pornia",
+    "Bactrocera quasiinfulata",
+    "Bactrocera absidata/antigone/vulgaris",
+    "Bactrocera albistrigata/frauenfeldi/kirki/psidii",
+    "Bactrocera breviaculeus/peninsularis/rufofuscula",
+    "Bactrocera bryoniae",
+    "Bactrocera halfordiae"
+    
+  ))) %>%
+    ggplot(aes(x=sample_name, y=Species, fill=Abundance)) +
+    geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent, na.value = NA, alpha=0.9) +
+  new_scale_fill() +
+  geom_tile(aes(fill = outcome))+
+  scale_y_discrete(limits=rev)+
+  scale_fill_manual(values=c("FP" = "#e41a1c", "FN"= "grey60"), na.value = NA) +
+  base_theme+
+  theme(legend.position = "right",
+        axis.text.y = element_text(face="italic"),
+        axis.title.y = element_blank())+
+    labs(x="Sample",
+         y="Taxon") +
+  facet_grid(pcr_primers~comm_size, drop=TRUE, space="free", scales="free")
+
+gg.sens_heatmap
+
+# Look at relative abundance
+gg.sens_bars <- sens_dat %>%
+  dplyr::filter(expected > 0, !Species == "Bactrocera tryoni complex") %>%
+  ggplot(aes(x=sample_name, y=Abundance, fill=Species)) +
+  geom_col()+
+  base_theme+
+  theme(legend.position = "right",
+        axis.text.y = element_text(face="italic"),
+        axis.title.y = element_blank())+
+    labs(x="Sample",
+         y="Taxon") +
+  scale_fill_brewer(palette = "Set1")+
+  facet_grid(pcr_primers~comm_size, drop=TRUE, space="free", scales="free_x")
+
+
+pdf(file="fig/sensitivity_plots.pdf", width = 11, height = 8 , paper="a4r")
+  plot(gg.sens_heatmap)
+  plot(gg.sens_bars)
+try(dev.off(), silent=TRUE)
+  
+
+# Diegos samples
+# Plot mocks only
+diego_dat <- heatmap_dat %>%
+  #filter(!str_detect(Species, "Damaged")) %>%
+  filter(str_detect(sample_name, "Diego")) %>%
+  #1filter(str_detect(sample_name, "Mock|Diego")) %>%
+  mutate(#Species = factor(Species),
+         sample_name = factor(sample_name, levels= trap_orders),
+         pcr_primers = factor(pcr_primers, levels= c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
+  mutate(comm_size = case_when(
+    sample_name %in% paste0("Mock", seq(1,4,1)) ~ "250 Ind",
+    sample_name %in% paste0("Mock", seq(5,8,1)) ~ "500 Ind",
+    sample_name %in% paste0("Mock", seq(9,12,1)) ~ "1000 Ind",
+    sample_name %in% paste0("Mock", seq(13,16,1)) ~ "2000 Ind",
+    str_detect(sample_name,"Diego") ~ "499:615 Ind"
+  ),
+  comm_size=factor(comm_size, levels=c("250 Ind", "500 Ind", "1000 Ind", "2000 Ind", "499:615 Ind"))
+  ) 
+
+gg.diego_heatmap <- diego_dat %>%
+    ggplot(aes(x=sample_name, y=Species, fill=Abundance)) +
+    geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent, na.value = NA, alpha=0.9) +
+  new_scale_fill() +
+  geom_tile(aes(fill = outcome))+
+  scale_y_discrete(limits=rev)+
+  scale_fill_manual(values=c("FP" = "#e41a1c", "FN"= "grey60", "Absent from DB" = "orange"), na.value = NA) +
+  base_theme+
+  theme(legend.position = "right",
+        axis.text.y = element_text(face="italic"),
+        axis.title.y = element_blank())+
+    labs(x="Sample",
+         y="Taxon") +
+  facet_grid(pcr_primers~comm_size, drop=TRUE, space="free", scales="free")
+
+gg.diego_heatmap
+
+pdf(file="fig/diego_plots.pdf", width = 11, height = 8 , paper="a4r")
+  plot(gg.diego_heatmap)
+try(dev.off(), silent=TRUE)
+  
+# Sensitivity vs Specificty
+# Calculate diagnostic accuracy metrics
+multimetric <- metric_set(accuracy, bal_accuracy, sens, yardstick::spec, precision, recall, ppv, npv)
+
+final_metrics <- heatmap_dat %>%
+  mutate(exp_outcome = case_when(
+    outcome == "TP" ~ 1,
+    outcome == "FP" ~ 0,
+    outcome == "FN" ~ 1
+  ), obs_outcome = case_when(
+    outcome == "TP" ~ 1,
+    outcome == "FP" ~ 1,
+    outcome == "FN" ~ 0
+  )) %>%
+  mutate(obs_outcome = factor(obs_outcome, levels=c(0, 1)),
+         exp_outcome = factor(exp_outcome, levels=c(0, 1))) %>%
+  group_by(pcr_primers) %>%
+  multimetric(truth = exp_outcome, estimate = obs_outcome)
+  
+```
+
+# Check false positive detections with blast
+
+# Write out false positives - Need to add an extra categery for not in reference database
+```{r}
+
+```
+
+```{bash}
+cd 
+module load BLAST+/2.11.0-gompi-2021a
+
+# Check COI
+cat COI_hierarchial.fa | sed 's/ /_/g' > COI_hierarchial_renamed.fa
+makeblastdb -in COI_hierarchial_renamed.fa -dbtype nucl
+
+blastn -db COI_hierarchial_renamed.fa -query query.fa -out out.fa -outfmt 7 -perc_identity 95
+
+
+# Check eif3l
+cat EIF3L_hierarchial.fa | sed 's/ /_/g' > EIF3L_hierarchial_renamed.fa
+makeblastdb -in EIF3L_hierarchial_renamed.fa -dbtype nucl
+
+blastn -db EIF3L_hierarchial_renamed.fa -query query_eif.fa -out out.fa -outfmt 7 -perc_identity 90
+
+
 ```
 
 # Barplots
@@ -647,14 +1031,23 @@ mismatch_joint <- final_ests %>%
     mean(mismatch_genus$pred_mismatch[match(to_match, mismatch_genus$spp_only)], na.rm=TRUE)
   }))
 
+library(ggstance )
+
+spp_cols <-  mypal(length(unique(heatmap_dat$Species)))
+names(spp_cols) <- unique(heatmap_dat$Species)
+
 gg.bias_lollipop <- mismatch_joint %>%
+  mutate(pcr_primers = factor(pcr_primers, levels= c("fwhF2-fwhR2nDac", "EIF3LminiF4-EIF3lminiR4"))) %>%
   ggplot(aes(x=gm_mean , y=Species, fill=pred_mismatch))+ 
-  geom_segment(aes(xend=1, yend=Species))+
-  geom_point(size=4, shape=21, colour="black")+
-  geom_text(aes(label=round(log10(gm_mean), 2)), nudge_y = 0.6)+
+  geom_line()+
+  #geom_segment(aes(xend=1, yend=Species), colour="black", position=position_dodgev(height = 0.5))+
+  geom_point(aes(shape=pcr_primers), size=4)+
+  scale_shape_manual(values=c(21, 24)) +
+ # geom_text(aes(label=round(log10(gm_mean), 2)), nudge_y = 0.6)+
   geom_vline(xintercept = 1, colour="black", size=1)  +
   scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
                 labels = trans_format("log10", math_format(10^.x))) +
+    scale_y_discrete(limits=rev)+
   annotation_logticks(sides="b", outside=TRUE) +
   base_theme +
   theme(#panel.grid.major.y = element_blank(),
@@ -662,35 +1055,41 @@ gg.bias_lollipop <- mismatch_joint %>%
         panel.grid.minor.x = element_blank(),
         legend.position = "bottom",
         axis.text.x = element_text(angle=0, hjust = 0.5, vjust = 1),
-        axis.text.y = element_text(face = "italic", colour =mypal(length(unique(heatmap_dat$Species)))),
+        axis.text.y = element_text(face = "italic"),
         legend.text = element_text(face="italic")) +
-    facet_grid(pcr_primers~., scales="free_x") +
-  scale_fill_distiller(palette = "RdBu", direction = -1) +
+  #  facet_grid(pcr_primers~., scales="free_x") +
+  scale_fill_distiller(palette = "RdYlBu", direction = -1) +
   labs(y = NULL, 
        x = "Detection efficiency / geometric mean",
       level = "Confidence interval",
       fill = "Primer mismatch")+
   coord_cartesian(clip = "off") 
 
+gg.bias_lollipop
+
 gg.bias_fit <- mismatch_joint %>%
-  ggplot(aes(x=scale(gm_mean, center = TRUE, scale = TRUE) , y=scale(pred_mismatch,center = TRUE, scale = TRUE), fill=Species))+ 
-  geom_point(size=3, shape=21, colour="black")+
+  ggplot(aes(x=scale(gm_mean, center = TRUE, scale = TRUE) , y=scale(0-pred_mismatch,center = TRUE, scale = TRUE), colour=Species))+ 
+  geom_point(aes(shape=pcr_primers),size=3)+
+  #geom_text(aes(label = Species))+
+  #scale_shape_manual(values=c(21, 24)) +
+  #geom_line()+
   geom_abline(lty = 2, colour = "gray80", size = 1) +
   base_theme +
   theme(#panel.grid.major.y = element_blank(),
         panel.grid.minor.y = element_blank(),
         panel.grid.minor.x = element_blank(),
-        legend.position = "none",
-        axis.text.x = element_text(angle=0, hjust = 0.5, vjust = 1),
-        axis.text.y = element_text(face = "italic"),
+        legend.position = "bottom",
         legend.text = element_text(face="italic")) +
-    facet_grid(pcr_primers~., scales="free_x") +
-  scale_fill_manual(values= mypal(length(unique(heatmap_dat$Species)))) +
+  #  facet_grid(pcr_primers~., scales="free_x") +
+  scale_colour_manual(values=spp_cols) +
   #scale_fill_distiller(palette = "RdBu", direction = -1) +
+  guides(shape="none") +
   labs(y = "Scaled primer mismatch", 
        x = "Scaled detection efficiency",
       level = "Confidence interval",
-      fill = "Species")
+      fill=NULL,
+      shape=NULL,
+      colour = "Species")
 
 # Colour text by species name
 
@@ -703,6 +1102,10 @@ pdf(file="fig/Fig5_bias.pdf", width = 11, height = 8 , paper="a4r")
 try(dev.off(), silent=TRUE)
 
 
+pdf(file="fig/Fig5_bias.pdf", width = 9, height = 7 , paper="a4r")
+  plot(gg.bias_lollipop)
+try(dev.off(), silent=TRUE)
+  
 ## Fit the metacal model to each pcr primer set and community type
 #fit_metacal <- joint %>%
 #  filter(expected > 0, observed > 0) %>%

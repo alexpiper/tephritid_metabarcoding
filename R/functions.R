@@ -1,4 +1,141 @@
 
+# Sample validation -------------------------------------------------------
+
+
+#Update the sample sheet and logging sheet to deal with any newly demultiplexed files
+step_demux_samdf <- function(samdf){
+    out <- samdf %>%
+      group_by(sample_id) %>%
+      group_split() %>%
+      purrr::map(function(x){
+        if(any(str_detect(x$pcr_primers, ";"))){
+          primer_names <- unlist(str_split(unique(x$pcr_primers), ";")) 
+          x <- x %>% 
+            mutate(count = length(primer_names)) %>% #Replicate the samples
+            uncount(count) %>%
+            mutate(pcr_primers = unlist(str_split(unique(x$pcr_primers), ";")),
+                   for_primer_seq = unlist(str_split(unique(x$for_primer_seq), ";")),
+                   rev_primer_seq = unlist(str_split(unique(x$rev_primer_seq), ";")),
+                   sample_id = paste0(sample_id, "_",pcr_primers)
+            ) 
+        }
+        if(!all(str_detect(x$sample_id, x$pcr_primers))){
+          x <- x %>%
+            mutate(sample_id = paste0(sample_id, "_",pcr_primers))
+        }
+        return(x)
+      }) %>%
+      bind_rows()
+    
+    # Check if files exist
+    data_folders <- paste0(list.dirs("data", recursive=FALSE), "/01_trimmed")
+    fastqFs <- purrr::map(data_folders,list.files, pattern="_R1_", full.names = TRUE) %>%
+      unlist() %>%
+      str_remove(pattern = "^(.*)\\/") %>%
+      str_remove(pattern = "(?:.(?!_S))+$")
+    fastqFs <- fastqFs[!str_detect(fastqFs, "Undetermined")]
+    #Check missing fastqs
+    if (length(setdiff(out$sample_id, fastqFs)) > 0) {
+      warning(paste0("The fastq file: ",
+                     setdiff(out$sample_id, fastqFs),
+                     " is missing, dropping from samplesheet \n")) 
+      out <- out %>%
+        filter(!sample_id %in% setdiff(out$sample_id, fastqFs))
+    }
+    return(out)
+}
+
+step_add_params <- function(samdf, params){
+  out <- samdf %>%
+    seqateurs::coalesce_join(params, by="pcr_primers")
+  return(out)
+}
+
+step_check_files <- function(samdf, files){
+  fastqFs <- files[str_detect(files, "_R1_")]
+  fastqFs <- basename(fastqFs) %>%
+    str_remove(pattern = "^(.*)\\/") %>%
+    str_remove(pattern = "(?:.(?!_S))+$")
+  fastqFs <- fastqFs[!str_detect(fastqFs, "Undetermined")]
+  
+  #Check missing in samplesheet
+  if (length(setdiff(fastqFs, samdf$sample_id)) > 0) {warning("The fastq file/s: ", setdiff(fastqFs, samdf$sample_id), " are not in the sample sheet") }
+  
+  #Check missing fastqs
+  if (length(setdiff(samdf$sample_id, fastqFs)) > 0) {
+    warning(paste0("The fastq file: ",
+                   setdiff(samdf$sample_id, fastqFs),
+                   " is missing, dropping from samplesheet \n")) 
+    samdf <- samdf %>%
+      filter(!sample_id %in% setdiff(samdf$sample_id, fastqFs))
+  }
+  return(samdf)
+}
+
+step_validate_folders <- function(project_dir){
+  # Required directories
+  list("data",
+       "reference",
+       "output/logs",
+       "output/results/final",
+       "output/results/unfiltered",
+       "output/results/filtered",
+       "output/rds",
+       "sample_data",
+       "temp") %>%
+    purrr::map(normalizePath) %>%
+    purrr::map(function(x){
+      if(!dir.exists(x)){
+        dir.create(x, recursive=TRUE)
+      }
+    })
+}
+
+step_validate_samdf <- function(samdf, data_dir){
+  # Check if sampleids contain fcid, if not; attatch
+  samdf <- samdf %>%
+    mutate(sample_id = case_when(
+      !str_detect(sample_id, fcid) ~ paste0(fcid,"_",sample_id),
+      TRUE ~ sample_id
+    ))
+  
+  # Check if forward read files match samplesheet
+  data_dir <- normalizePath(data_dir)
+  fastqFs <- purrr::map(list.dirs(data_dir, recursive=FALSE),
+                        list.files, pattern="_R1_", full.names = TRUE) %>%
+    unlist() %>%
+    str_remove(pattern = "^(.*)\\/") %>%
+    str_remove(pattern = "(?:.(?!_S))+$")
+  fastqFs <- fastqFs[!str_detect(fastqFs, "Undetermined")]
+  #Check missing in samplesheet
+  if (length(setdiff(fastqFs, samdf$sample_id)) > 0) {warning("The fastq file/s: ", setdiff(fastqFs, samdf$sample_id), " are not in the sample sheet") }
+  
+  # Check if reverse files match samplesheet
+  data_dir <- normalizePath(data_dir)
+  fastqRs <- purrr::map(list.dirs(data_dir, recursive=FALSE),
+                        list.files, pattern="_R2_", full.names = TRUE) %>%
+    unlist() %>%
+    str_remove(pattern = "^(.*)\\/") %>%
+    str_remove(pattern = "(?:.(?!_S))+$")
+  fastqRs <- fastqRs[!str_detect(fastqRs, "Undetermined")]
+  
+  #Check missing in samplesheet
+  if (length(setdiff(fastqFs, samdf$sample_id)) > 0) {warning("The fastq file/s: ", setdiff(fastqFs, samdf$sample_id), " are not in the sample sheet") }
+  
+  #Check missing fastqs
+  if (length(setdiff(samdf$sample_id, fastqFs)) > 0) {
+    warning(paste0("The fastq file: ",
+                   setdiff(samdf$sample_id, fastqFs),
+                   " is missing, dropping from samplesheet \n")) 
+    samdf <- samdf %>%
+      filter(!sample_id %in% setdiff(samdf$sample_id, fastqFs))
+  }
+  return(samdf)
+}
+  
+
+
+
 # Quality control ---------------------------------------------------------
 
 step_seq_qc <- function(fcid, quiet=FALSE){
@@ -173,17 +310,20 @@ step_switching_calc <- function(fcid, multithread=FALSE, quiet=FALSE){
     dplyr::pull(sum)
   
   #Summary of index switching rate
-  
-  res <- switched %>%
-    dplyr::mutate(type = case_when(
-      !stringr::str_detect(Sample_Name, "Undetermined") ~ "expected",
-      stringr::str_detect(Sample_Name, "Undetermined") ~ "observed"
-    )) %>%
-    dplyr::group_by(type) %>%
-    dplyr::summarise(switch_rate = sum(Freq), .groups = "drop") %>%
-    tidyr::pivot_wider(names_from = type,
-                       values_from = switch_rate) %>%
-    dplyr::mutate(switch_rate =  observed / expected )
+  if(any(stringr::str_detect(switched$Sample_Name, "Undetermined"))){
+    res <- switched %>%
+      dplyr::mutate(type = case_when(
+        !stringr::str_detect(Sample_Name, "Undetermined") ~ "expected",
+        stringr::str_detect(Sample_Name, "Undetermined") ~ "observed"
+      )) %>%
+      dplyr::group_by(type) %>%
+      dplyr::summarise(switch_rate = sum(Freq), .groups = "drop") %>%
+      tidyr::pivot_wider(names_from = type,
+                         values_from = switch_rate) %>%
+      dplyr::mutate(switch_rate =  observed / expected )
+  } else {
+    res <- tibble(expected = sum(switched$Freq), observed=0, switch_rate=0)
+  }
   
   readr::write_csv(res, normalizePath(paste0(qc_dir, "index_switching.csv")))
   
@@ -216,8 +356,13 @@ step_switching_calc <- function(fcid, multithread=FALSE, quiet=FALSE){
 plot_read_quals <- function(sample_id, input_dir, truncLen = NULL, quiet=FALSE){
   input_dir <- normalizePath(input_dir)
   # Seq dir might need ot be changed to trimmed or other sub folders
-  fastqFs <- fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "*_R1_*"))
-  fastqRs <- fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "*_R2_*"))
+  fastqFs <- normalizePath(fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "_S*_R1_*")))
+  fastqRs <- normalizePath(fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "_S*_R2_*")))
+  
+  if(length(fastqFs) == 0 ){
+    message(paste0("Sample ", sample_id, " Has no reads"))
+    return(NULL)
+  }
   if(!file.size(fastqFs) > 28) {
     message(paste0("Sample ", sample_id, " Has no reads"))
     return(NULL)
@@ -265,95 +410,7 @@ plot_read_quals <- function(sample_id, input_dir, truncLen = NULL, quiet=FALSE){
 
 # Primer trimming ---------------------------------------------------------
 
-step_primer_trim <- function(sample_id, seq_dir, qc_dir, for_primer_seq, rev_primer_seq, quiet=FALSE){
-  # Check inputs
-  if(!is.character(for_primer_seq) | !length(for_primer_seq)==1){
-    stop("for_primer_seq must be a character vector of length 2, containing forward and reverse primers")
-  }
-  if(!is.character(rev_primer_seq) | !length(rev_primer_seq)==1){
-    stop("rev_primer_seq must be a character vector of length 2, containing forward and reverse primers")
-  }
-  
-  # Check that required files exist
-  if(!dir.exists(seq_dir)) {
-    stop("seq_dir doesnt exist, check that the correct path was provided")
-  }
-  # Create qc_dir if it doesnt exist
-  if(!dir.exists(qc_dir)) {dir.create(qc_dir, recursive = TRUE)}
-  
-  primers <- c(for_primer_seq, rev_primer_seq)
-  primers <- str_replace_all(primers, "I", "N")
-  
-  fastqFs <- fs::dir_ls(path = seq_dir, glob = paste0("*",sample_id, "*_R1_*"))
-  fastqRs <- fs::dir_ls(path = seq_dir, glob = paste0("*",sample_id, "*_R2_*"))
-  if(length(fastqFs) != length(fastqRs)) stop(paste0("Forward and reverse files for ",sample_id," do not match."))
-  
-  #Check if there were more than 1 primer per sample
-  multi_primer <- any(stringr::str_detect(primers, ";"))
-  
-  if (multi_primer) {
-    # Create output directory
-    demuxpath <- file.path(seq_dir, "00_demux")
-    dir.create(demuxpath)
-    
-    Fprimers <- unlist(str_split(unique(primers[1]), ";"))
-    Rprimers <- unlist(str_split(unique(primers[2]), ";"))
-    primer_names <- unlist(str_split(unique(primers), ";"))
-    
-    # Demultiplex reads
-    demux <- bbdemux2(install="bin/bbmap", fwd=fastqFs, rev=fastqRs, Fbarcodes = Fprimers, 
-                      Rbarcodes = Rprimers, names=primer_names, degenerate=TRUE, out.dir=demuxpath,
-                      threads=1, mem=4,  hdist=0, force=TRUE)
-    
-    # Rename output files to match the required pipeline format
-    old_names <- fs::dir_ls(path = demuxpath, glob = paste0("*",sample_id, "*_R1R2_*"))
-    new_names <- old_names %>%
-      basename() %>%
-      stringr::str_remove(".fastq.gz") %>%
-      stringr::str_split("_", n=Inf) %>%
-      purrr::map_chr(function(x){
-        paste0(paste0(c(x[1:3], x[length(x)], x[4:(length(x)-1)]), collapse = "_"),".fastq.gz")
-      }) 
-    if(file.exists(file.path(dirname(old_names), new_names))){
-      file.remove(file.path(dirname(old_names), new_names))
-    }
-    file.rename(old_names, file.path(dirname(old_names), new_names))
-    
-    # Trim primers from demultiplexed fastq
-    demux_fastqs <- fs::dir_ls(path = demuxpath, glob = paste0("*",sample_id, "*_R1R2_*"))
-    res <- bbtrim2(install="bin/bbmap", fwd = demux_fastqs,
-                   primers = c(Fprimers, Rprimers), checkpairs = FALSE,
-                   degenerate = TRUE, out.dir=file.path(seq_dir, "01_trimmed"), trim.end = "left", 
-                   kmer=NULL, tpe=TRUE, tbo=TRUE,
-                   ordered = TRUE, mink = FALSE, hdist = 2,
-                   maxlength =(max(step_data$for_read_length, step_data$rev_read_length
-                   ) - sort(nchar(c(Fprimers, Rprimers)), decreasing = FALSE)[1]) +5, force = TRUE, quiet=FALSE)
-    
-    # Re-split interleaved fastq's
-    trimmedpath <- file.path(seq_dir, "01_trimmed") 
-    trimmed_fastqs<- fs::dir_ls(path = trimmedpath, glob = paste0("*",sample_id, "*_R1R2_*"))
-    bbsplit2(install="bin/bbmap", file=trimmed_fastqs, force=TRUE)
-    
-  } else if (!multi_primer) {
-    Fprimers <- primers[1]
-    Rprimers <- primers[2]
-    
-    res <- bbtrim2(install="bin/bbmap", fwd = fastqFs, rev = fastqRs,
-                   primers = c(Fprimers, Rprimers), checkpairs = FALSE,
-                   degenerate = TRUE, out.dir=file.path(seq_dir, "01_trimmed"), trim.end = "left", 
-                   kmer=NULL, tpe=TRUE, tbo=TRUE,
-                   ordered = TRUE, mink = FALSE, hdist = 2,
-                   maxlength =(max(step_data$for_read_length, step_data$rev_read_length
-                   ) - sort(nchar(c(Fprimers, Rprimers)), decreasing = FALSE)[1]) +5,
-                   force = TRUE, quiet=FALSE)
-  }
-  return(res)
-}
-
-
-
-
-step_primer_trim2 <- function(sample_id, input_dir, output_dir, qc_dir, for_primer_seq, rev_primer_seq, pcr_primers,
+step_primer_trim <- function(sample_id, input_dir, output_dir, qc_dir, for_primer_seq, rev_primer_seq, pcr_primers,
                              n = 1e6, qualityType = "Auto", check_paired = TRUE, compress =TRUE, quiet=FALSE){
   input_dir <- normalizePath(input_dir)
   output_dir <- normalizePath(output_dir)
@@ -376,8 +433,8 @@ step_primer_trim2 <- function(sample_id, input_dir, output_dir, qc_dir, for_prim
   # Create qc_dir if it doesnt exist
   if(!dir.exists(qc_dir)) {dir.create(qc_dir, recursive = TRUE)}
   
-  fastqFs <- normalizePath(fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "*_R1_*")))
-  fastqRs <- normalizePath(fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "*_R2_*")))
+  fastqFs <- normalizePath(fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "_S*_R1_*")))
+  fastqRs <- normalizePath(fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "_S*_R2_*")))
   if(length(fastqFs) != length(fastqRs)) stop(paste0("Forward and reverse files for ",sample_id," do not match."))
   
   #Check if there were more than 1 primer per sample
@@ -391,17 +448,21 @@ step_primer_trim2 <- function(sample_id, input_dir, output_dir, qc_dir, for_prim
     
     # Define outfiles
     fwd_out <- purrr::map(primer_names, ~{
-      normalizePath(paste0(output_dir,"/", str_replace(basename(fastqFs), ".fastq", paste0("_",.x, ".fastq"))))
+      new_sampleid <- paste0(sample_id, "_",.x)
+      return(normalizePath(paste0(output_dir,"/", str_replace(basename(fastqFs), sample_id, new_sampleid))))
     }) %>%
       unlist()
     rev_out <- purrr::map(primer_names, ~{
-      normalizePath(paste0(output_dir,"/", str_replace(basename(fastqRs), ".fastq", paste0("_",.x, ".fastq"))))
+      new_sampleid <- paste0(sample_id, "_",.x)
+      return(normalizePath(paste0(output_dir,"/", str_replace(basename(fastqRs), sample_id, new_sampleid))))
     }) %>%
       unlist()
     
   } else if (!multi_primer) {
-    fwd_out <- normalizePath(paste0(output_dir,"/", basename(fastqFs)))
-    rev_out <- normalizePath(paste0(output_dir,"/", basename(fastqRs)))
+    # CHange this to rename samples if primers not present
+    new_sampleid <- paste0(sample_id, "_",pcr_primers)
+    fwd_out <- normalizePath(paste0(output_dir,"/", str_replace(basename(fastqFs), sample_id, new_sampleid)))
+    rev_out <- normalizePath(paste0(output_dir,"/", str_replace(basename(fastqRs), sample_id, new_sampleid)))
   } 
   
   # Demultiplex reads and trim primers
@@ -413,10 +474,11 @@ step_primer_trim2 <- function(sample_id, input_dir, output_dir, qc_dir, for_prim
                      rev_primer_seq = str_replace_all(rev_primer_seq, "I", "N"),
                      n = n, qualityType = qualityType, check_paired = check_paired,
                      compress =compress, quiet=quiet
-  )
+  ) %>%
+    mutate(fwd_out = fwd_out,
+           rev_out = rev_out)
   return(res)
 }
-
 
 step_read_filter <- function(sample_id, input_dir, output_dir, quiet=FALSE, ...){
   input_dir <- normalizePath(input_dir)
@@ -429,10 +491,9 @@ step_read_filter <- function(sample_id, input_dir, output_dir, quiet=FALSE, ...)
   # Create output directory if it doesn't exist
   if(!dir.exists(output_dir)) {dir.create(output_dir)}
   
-  
-  fastqFs <- fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "*_R1_*"))
-  fastqRs <- fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "*_R2_*"))
-  
+  fastqFs <- normalizePath(fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "_S*_R1_*")))
+  fastqRs <- normalizePath(fs::dir_ls(path = input_dir, glob = paste0("*",sample_id, "_S*_R2_*")))
+
   if(length(fastqFs) != length(fastqRs)) stop(paste0("Forward and reverse files for ",sample_id," do not match."))
 
   # Run read filter
@@ -442,7 +503,9 @@ step_read_filter <- function(sample_id, input_dir, output_dir, quiet=FALSE, ...)
     rm.phix = TRUE, multithread = FALSE, compress = TRUE, verbose = !quiet, ...) %>%
     as_tibble() %>%
     dplyr::rename(filter_input = reads.in,
-                  filter_output = reads.out)
+                  filter_output = reads.out) %>%
+    mutate(fwd_out = file.path(output_dir, basename(fastqFs)),
+           rev_out = file.path(output_dir, basename(fastqRs)))
   
   filtered_summary <- res %>% 
     as.data.frame() %>%
@@ -682,7 +745,8 @@ step_dada2 <- function(fcid, input_dir, output, qc_dir, nbases=1e+08, randomize=
     magrittr::set_colnames(c("dadaFs", "dadaRs", "merged")) %>%
     as.data.frame() %>%
     rownames_to_column("sample_id") %>%
-    mutate(sample_id = str_replace(basename(sample_id), pattern="_S.*$", replacement=""))
+    mutate(sample_id = str_replace(basename(sample_id), pattern="_S.*$", replacement="")) %>%
+    as_tibble()
   return(res)
 }
 
@@ -836,7 +900,7 @@ step_assign_taxonomy <- function(seqtab, output=NULL, qc_dir, database, threshol
                                  ranks = c("Root","Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") ){
   # Print arguments for testing
   # Load the relevent db
-  trainingSet <- readRDS(database)
+  trainingSet <- readRDS(normalizePath(database))
   
   # get the sequences from the seqtab
   dna <- DNAStringSet(getSequences(seqtab)) # Create a DNAStringSet from the ASVs
@@ -903,7 +967,7 @@ step_join_tax <- function(tax, blast_spp, output=NULL, propagate_tax=FALSE,
       is.na(Species) & Genus == blast_genus ~ blast_spp,
       !is.na(Species) ~ Species
     )) %>%
-    dplyr::select(OTU, ranks) %>%
+    dplyr::select(OTU, all_of(ranks)) %>%
     column_to_rownames("OTU")
   
   if(propagate_tax){
@@ -914,6 +978,187 @@ step_join_tax <- function(tax, blast_spp, output=NULL, propagate_tax=FALSE,
   if(!is.null(output)){saveRDS(tax_blast, output)}
   return(tax_blast)
 }
+
+
+# Outputs -----------------------------------------------------------------
+
+step_phangorn <- function(seqtab, output=NULL){
+
+  seqs <- getSequences(seqtab)
+  names(seqs) <- seqs # This propagates to the tip labels of the tree
+  alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA)
+  
+  phang.align <- phyDat(as(alignment, "matrix"), type="DNA")
+  dm <- dist.ml(phang.align)
+  
+  #Fit NJ tree
+  treeNJ <- NJ(dm) # Note, tip order != sequence order
+  fit <- pml(treeNJ, data=phang.align)
+  
+  #Fit ML tree
+  fitGTR <- update(fit, k=4, inv=0.2)
+  fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+                      rearrangement = "stochastic", control = pml.control(trace = 0))
+  
+  # Write phytree to disk
+  saveRDS(fitGTR, "output/rds/phytree.rds") 
+  
+  #Output newick tree
+  if(!is.null(output)){write.tree(fitGTR$tree, file=output)}
+  
+}
+
+step_phyloseq <- function(seqtab_path, taxtab_path, samdf_path, seqs_path=NULL, phy_path=NULL){
+
+  seqtab <- readRDS(normalizePath(seqtab_path))
+  taxtab <- readRDS(normalizePath(taxtab_path))
+  samdf <- read_csv(normalizePath(samdf_path))
+  if(is.null(seqs_path)){
+    seqs <- DNAStringSet(colnames(seqtab))
+    names(seqs) <- seqs
+  } else {
+    seqs <- readRDS(normalizePath(seqs_path))
+  }
+  if(!is.null(phy_path)){
+    phy <- read.tree(normalizePath(seqtab_path))
+  } else {
+    phy <- NULL
+  }
+  #Extract start of sequence names
+  rownames(seqtab) <- str_replace(rownames(seqtab), pattern="_S[0-9].*$", replacement="")
+  
+  #Load sample information
+  samdf <- samdf %>%
+    filter(!duplicated(sample_id)) %>%
+    as.data.frame()%>%
+    magrittr::set_rownames(.$sample_id)
+  
+  if(is.null(phy)){
+    ps <- phyloseq(tax_table(taxtab),
+                   sample_data(samdf),
+                   otu_table(seqtab, taxa_are_rows = FALSE),
+                   refseq(seqs))
+  } else {
+    ps <- phyloseq(tax_table(taxtab),
+                   sample_data(samdf),
+                   otu_table(seqtab, taxa_are_rows = FALSE),
+                   phy_tree(phy),
+                   refseq(seqs))
+  }
+  if(nrow(seqtab) > nrow(sample_data(ps))){
+    message("Warning: the following samples were not included in phyloseq object, check sample names match the sample metadata")
+    message(rownames(seqtab)[!rownames(seqtab) %in% sample_names(ps)])
+  }
+  return(ps)
+}
+
+step_rareplot <- function(ps, min_reads=1000, plot_dir=NULL){
+  #Create rarefaction curve
+  rare <- otu_table(ps) %>%
+    as("matrix") %>%
+    rarecurve(step=max(sample_sums(ps))/100) %>%
+    purrr::map(function(x){
+      b <- as.data.frame(x)
+      b <- data.frame(OTU = b[,1], count = rownames(b))
+      b$count <- as.numeric(gsub("N", "",  b$count))
+      return(b)
+    }) %>%
+    purrr::set_names(sample_names(ps)) %>%
+    bind_rows(.id="sample_id")
+  
+  gg.rare <- ggplot(data = rare)+
+    geom_line(aes(x = count, y = OTU, group=sample_id), alpha=0.5)+
+    geom_point(data = rare %>% 
+                 group_by(sample_id) %>% 
+                 top_n(1, count),
+               aes(x = count, y = OTU, colour=(count > min_reads))) +
+    geom_label(data = rare %>% 
+                 group_by(sample_id) %>% 
+                 top_n(1, count),
+               aes(x = count, y = OTU,label=sample_id, colour=(count > min_reads)),
+               hjust=-0.05)+
+    scale_x_continuous(labels =  scales::scientific_format()) +
+    geom_vline(xintercept=min_reads, linetype="dashed") +
+    labs(colour = "Sample kept?") +
+    xlab("Sequence reads") +
+    ylab("Observed ASV's")
+  
+  #Write out figure
+  pdf(file=normalizePath(paste0(plot_dir, "/rarefaction.pdf")), width = 11, height = 8 , paper="a4r")
+  plot(gg.rare)
+  try(dev.off(), silent=TRUE)
+  
+}
+
+step_filter_phyloseq <- function(ps, min_reads=1000, quiet=FALSE){
+    #Remove all samples under the minimum read threshold 
+  ps1 <- ps %>%
+    prune_samples(sample_sums(.)>=min_reads, .) %>% 
+    filter_taxa(function(x) mean(x) > 0, TRUE) #Drop missing taxa from table
+  
+  #Message how many were removed
+  if(!quiet){message(nsamples(ps) - nsamples(ps1), " Samples and ", ntaxa(ps) - ntaxa(ps1), " ASVs dropped")}
+  return(ps1)
+}
+
+# Export samples
+step_output_summary <- function(ps, out_dir, type="unfiltered"){
+  #Export raw csv
+  speedyseq::psmelt(ps) %>%
+    filter(Abundance > 0) %>%
+    dplyr::select(-Sample) %>%
+    write_csv(normalizePath(paste0(out_dir,"/raw_", type,".csv")))
+  
+  # Export species level summary of filtered results
+  seqateurs::summarise_taxa(ps, "Species", "sample_id") %>%
+    spread(key="sample_id", value="totalRA") %>%
+    write.csv(file = normalizePath(paste0(out_dir,"/spp_sum_",type,".csv")))
+  
+  seqateurs::summarise_taxa(ps, "Genus", "sample_id") %>%
+    spread(key="sample_id", value="totalRA") %>%
+    write.csv(file =  normalizePath(paste0(out_dir,"/gen_sum_",type,".csv")))
+  
+  #Output fasta of all ASV's
+  seqateurs::ps_to_fasta(ps, normalizePath(paste0(out_dir,"/asvs_",type,".fasta")), seqnames="Species")
+  
+  if(!is.null(phy_tree(ps, errorIfNULL = FALSE))){
+    #Output newick tree
+    write.tree(phy_tree(ps), file= normalizePath(paste0(out_dir,"/tree_",type,".nwk")))
+  }
+}
+
+step_output_imap <- function(ps, out_dir){
+  seqtab <- otu_table(ps) %>%
+    as("matrix") %>%
+    as_tibble(rownames = "sample_id")
+  
+  taxtab <- tax_table(ps) %>%
+    as("matrix") %>%
+    as_tibble(rownames = "OTU") %>%
+    unclassified_to_na(rownames = FALSE)
+  
+  #Check taxonomy table outputs
+  if(!all(colnames(taxtab) == c("OTU", "Root", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))){
+    message("Warning: Taxonomy table columns do not meet expectations for the staging database \n
+          Database requires the columns: OTU, Root, Kingdom, Phylum, Class, Order, Family, Genus, Species ")
+  }
+  
+  if(any(str_detect(taxtab$Species, "/"))){
+    message("Warning: Taxonomy table contains taxa with clashes at the species level, these should be corrected before upload:")
+    clashes <- taxtab$Species[str_detect(taxtab$Species, "/")]
+    print(clashes[!is.na(clashes)])
+  }
+  
+  samdf <- sample_data(ps) %>%
+    as("matrix") %>%
+    as_tibble()
+  
+  # Write out
+  write_csv(seqtab, normalizePath(paste0(out_dir,"/seqtab.csv")))
+  write_csv(taxtab, normalizePath(paste0(out_dir,"/taxtab.csv")))
+  write_csv(samdf, normalizePath(paste0(out_dir,"/samdf.csv")))
+}
+
 
 
 # Utilities ---------------------------------------------------------------
@@ -955,3 +1200,4 @@ remove_if_exists <- function(file, quiet=FALSE){
     }
   }
 }
+

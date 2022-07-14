@@ -383,29 +383,45 @@ filt %>%
             perc = scales::percent(final / starting,accuracy = 0.1))
 
 # Output summary of cleanup for supplementary 
-filt %>%
+gg.db_filt <- filt %>%
   pivot_longer(-c("acc", "tax_id", "species", "loci"),
                names_to="stage",
                values_to = "kept") %>%
   group_by(loci, stage) %>%
   summarise(kept = sum(kept==TRUE)) %>%
   ungroup()%>%
-  mutate(stage = factor(stage, levels=c("uniqseqs","namefilt","misannot","phmm","codonfilt","purged","pruned"))) %>%
+  mutate(stage = stage %>%
+           str_replace("uniqseqs", "Unique Sequences") %>%
+           str_replace("namefilt", "Binomial names only") %>%
+           str_replace("misannot", "Misannotated taxonomy") %>%
+           str_replace("phmm", "PHMM") %>%
+           str_replace("codonfilt", "Codon filter") %>%
+           str_replace("purged", "Mixed taxonomy") %>%
+           str_replace("pruned", "Maximum 5 seqs per taxa")) %>%
+  mutate(stage = factor(stage, levels=c("Unique Sequences",
+                                        "Binomial names only",
+                                        "Misannotated taxonomy",
+                                        "PHMM",
+                                        "Codon filter",
+                                        "Mixed taxonomy",
+                                        "Maximum 5 seqs per taxa"))) %>%
   ggplot(aes(x = stage, y = kept, fill=loci))+
   geom_col() +
-  geom_text(aes(label=kept), colour="white",nudge_y = -50)+
+  geom_text(aes(label=kept), colour="black",nudge_y = -50)+
   facet_grid(loci~., scales="free_y")+
-  scale_fill_brewer(palette="Set1")
+  scale_fill_brewer(palette="Set1") +
+    base_theme+
+  theme(legend.position = "right")+
+  labs(x = "Database curation step",
+       y = "Sequences remaining",
+       fill = "Locus")
 
-filt %>%
-  pivot_longer(-loci,
-               names_to="step",
-               values_to="seqs") %>%
-  mutate(step = factor(step, levels=c("seqs", "uniqseqs", "namefilt", "phmm", "codonfilt", "purged"))) %>%
-  ggplot(aes(x = step, y = seqs))+
-  geom_col()+
-  facet_grid(loci~., scales="free_y")
+gg.db_filt
 
+
+pdf(file="fig/database_filt.pdf", width = 11, height = 8)
+  plot(gg.db_filt)
+try(dev.off(), silent=TRUE)
 ```
 
 # Entropy
@@ -1986,6 +2002,9 @@ filt <- c("diagnostic_alignments/cleaned/COI.fa.gz",
     seqs <- insect::readFASTA(x)
     names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
     
+    # Subset for testing
+    #seqs <- seqs[1:100]
+    
     #load phmm
     model <- readRDS(fs::dir_ls(path="diagnostic_alignments/model", glob = paste0("*",loci_name,"*")))
     
@@ -2002,11 +2021,17 @@ filt <- c("diagnostic_alignments/cleaned/COI.fa.gz",
      kmer_threshold = 0.3, k = 5,
      multithread=ncores, quiet=FALSE, progress = FALSE)
     
-    insect::writeFASTA(seqs, file=paste0("reference/", loci_name, ".fa.gz"), compress=TRUE)
+    # Find those with high intraspecific distances
+    high_intra <- find_outlier_intraspp(filtered, threshold = 0.03)
     
+    filtered2 <- filtered[!filtered %in% high_intra]
     
-    seqs_ref <- reformat_hierarchy(seqs, db = db)
+    insect::writeFASTA(filtered2, file=paste0("reference/", loci_name, ".fa.gz"), compress=TRUE)
     
+    seqs_ref <- reformat_hierarchy(filtered2, db = db)
+    
+    #seqs_ref <- reformat_hierarchy(filtered, db = db)
+
     lineage <- names(seqs_ref)%>% 
                 stringr::str_split_fixed(";", n = Inf) %>% 
                   tibble::as_tibble() %>%
@@ -2035,8 +2060,12 @@ filt <- c("diagnostic_alignments/cleaned/COI.fa.gz",
     # Write out refernce sets
     names(seqs_ref) <- names(seqs_ref) %>% str_replace_all("_", " ")
     insect::writeFASTA(seqs_ref, file=paste0("reference/", loci_name, "_hierarchial.fa.gz"), compress=TRUE)
-      
+    
     # Train IDTAXA
+    
+    # Test new names
+    #names(seqs_ref) <- names(seqs_ref)  %>% str_replace_all(" ", "_")
+    
     training_set <- train_idtaxa(
       seqs_ref, max_group_size = 10, max_iterations = 3,  
       allow_group_removal = TRUE,  get_lineage = FALSE, quiet = FALSE
@@ -2045,7 +2074,56 @@ filt <- c("diagnostic_alignments/cleaned/COI.fa.gz",
     #Write out training set
     dir.create("reference")
     saveRDS(training_set, file=paste0("reference/", loci_name, "_idtaxa.rds"))
+    
+    # Rename species complexes
+    to_rename <- find_complexes(seqs_ref)
+    
+    # Make plots of barcode gap for the species complexes
+    #    # Make full distance matrix
+    #datd <- DECIPHER::DistanceMatrix(dna, includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
+    #                                 penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor", processors = 1, verbose= TRUE)
+    #
+    #spp_names <- names(dna) %>%
+    #  str_remove("^.*;")
+    #
+    #distobj = datd
+    #sppVector = spp_names
+    #
+    ## Barcode gap - Do these for each species complex 
+    #test <- tibble::enframe(intra_dist(datd, spp_names), name="Species", value="intra") %>%
+    #  left_join(tibble::enframe(inter_dist(datd, spp_names), name="Species", value="inter"))
+    #
+    #test %>%
+    #  pivot_longer(-Species,
+    #               names_to = "type",
+    #               values_to = "dist")%>%
+    #  ggplot(aes(x = dist, fill=type)) +
+    #  geom_histogram()
 
+
+    new_names <- names(seqs_ref) %>%
+      purrr::map_chr(~{
+        current_spp <- .x %>% str_remove("^.*;")
+        new_spp <- to_rename$new_names[match(current_spp, to_rename$old_names)]
+        out <- .x %>% str_replace(current_spp, new_spp)
+        return(out)
+      })
+    seqs_ref2 <- seqs_ref
+    names(seqs_ref2) <- new_names
+      
+     # Write out refernce sets
+   #names(seqs_ref2) <- names(seqs_ref2) %>% str_replace_all("_", " ")
+    insect::writeFASTA(seqs_ref2, file=paste0("reference/", loci_name, "_hierarchial_renamed.fa.gz"), compress=TRUE)
+    
+    # Train IDTAXA
+    training_set2 <- train_idtaxa(
+      seqs_ref2, max_group_size = 10, max_iterations = 3,  
+      allow_group_removal = TRUE,  get_lineage = FALSE, quiet = FALSE
+      )
+    
+    #Write out training set
+    dir.create("reference")
+    saveRDS(training_set2, file=paste0("reference/", loci_name, "_idtaxa_renamed.rds"))
 })%>%
   bind_rows()
 

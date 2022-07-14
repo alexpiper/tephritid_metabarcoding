@@ -368,3 +368,179 @@ evaluate_primer <- function(x, primer, positions=NULL, direction="F", mm_positio
   if(primer_region_1){mm_scores <- mm_scores[1,]}# remove duplicated row, as only one sequence
   return(mm_scores)
 }
+
+
+# Taxonomic filtering -----------------------------------------------------
+
+intra_dist <- function(distobj, sppVector = NULL, return_max = TRUE, return_names=FALSE, na_rm = FALSE) {
+  dat <- as.matrix(distobj)
+  seqnames <- dimnames(dat)[[1]]
+  if (length(sppVector) > 0) {
+    dimnames(dat)[[1]] <- sppVector
+  }
+  conSpecDists <- vector("list", length=length(dimnames(dat)[[1]]))
+  for (i in 1:length(dimnames(dat)[[1]])) {
+    conSpec <- dimnames(dat)[[1]] == dimnames(dat)[[1]][i]
+    if(return_max){
+      conSpecDists[[i]] <- max(dat[conSpec, i], na.rm = na_rm)
+    } else {
+      conSpecDists[[i]] <- dat[conSpec, i]
+      if(length(conSpecDists[[i]]) == 1) {names(conSpecDists[[i]]) <- dimnames(dat)[[1]][i]}
+      if(return_names){names(conSpecDists[[i]]) <- seqnames[conSpec]}
+    }
+  }
+  if(return_max){
+    out <- unlist(conSpecDists)
+    names(out) <- sppVector
+  } else {
+    out <- conSpecDists
+    names(out)<- sppVector
+  }
+  return(out)
+}
+
+inter_dist <- function(distobj, sppVector = NULL, return_min = TRUE, na_rm = FALSE) {
+  dat <- as.matrix(distobj)
+  if (length(sppVector) > 0) {
+    dimnames(dat)[[1]] <- sppVector
+  }
+  nonSpecDists <- vector("list", length=length(dimnames(dat)[[1]]))
+  for (i in 1:length(dimnames(dat)[[1]])) {
+    nonSpec <- dimnames(dat)[[1]] != dimnames(dat)[[1]][i]
+    if(return_min){
+      nonSpecDists[[i]] <- min(dat[nonSpec, i], na.rm = na_rm)
+    } else {
+      nonSpecDists[[i]] <- dat[nonSpec, i]
+    }
+  }
+  if(return_min){
+    out <- unlist(nonSpecDists)
+    names(out) <- sppVector
+  } else {
+    out <- nonSpecDists
+    names(out)<- sppVector
+  }
+  return(out)
+}
+
+find_large_intraspp <- function(seqs, threshold=0.05){
+  spp_names <- names(seqs) %>%
+    stringr::str_remove("^.*;")
+  
+  if(length(table(lengths(seqs))) > 1){
+    stop("seqs must be aligned")
+  }
+  
+  # Make full distance matrix from aligned sequence
+  distmat <- DECIPHER::DistanceMatrix(seqs, includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
+                                      penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor",
+                                      processors = 1, verbose= TRUE)
+  
+  #calculate intraspecific distrance
+  intra_spp_dist <- intra_dist(distmat, spp_names, return_max = FALSE, return_names = TRUE)
+  
+  # return those with intraspecific distances over the threshold
+  out <- intra_spp_dist[sapply(intra_spp_dist, max) > threshold]
+  return(out)
+}
+
+find_outlier_intraspp <- function(seqs, threshold=0.05){
+  if(is(seqs, "DNAbin")){seqs <- DNAbin2DNAstringset(seqs)}
+  spp_names <- names(seqs) %>%
+    stringr::str_remove("^.*;")
+  
+  if(length(table(lengths(seqs))) > 1){
+    stop("seqs must be aligned")
+  }
+  searchspace <- find_large_intraspp(seqs, threshold=threshold)
+  searchspace <- searchspace <- searchspace[!duplicated(names(searchspace))]
+  
+  # subset seqs and make distance matrix for each
+  out <- vector("list", length = length(searchspace))
+  names(out) <- names(searchspace)
+  for (s in 1:length(searchspace)){
+    subset_seqs <- seqs[str_detect(names(seqs), names(searchspace)[s])]
+    distmat <- DECIPHER::DistanceMatrix(subset_seqs, includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
+                                        penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor",
+                                        processors = 1, verbose= TRUE)
+
+    ## find index of most central element
+    center <- which.min(apply(distmat,1,median))
+    
+    ## distance from each element to most central element
+    dd <- distmat[center,]
+    out[[s]] <- as.DNAbin(subset_seqs[dd > threshold])
+  }
+  out <- concat_DNAbin(out)
+  return(out)
+}
+
+
+find_complexes <- function(seqs){
+  if(is(seqs, "DNAbin")){seqs <- DNAbin2DNAstringset(seqs)}
+  spp_names <- names(seqs) %>%
+    str_remove("^.*;")
+  
+  if(length(table(lengths(seqs))) > 1){
+    stop("seqs must be aligned")
+  }
+  # Make full distance matrix
+  distmat <- DECIPHER::DistanceMatrix(seqs, includeTerminalGaps = FALSE, penalizeGapLetterMatches = TRUE,
+                                      penalizeGapGapMatches = FALSE, correction = "Jukes-Cantor",
+                                      processors = 1, verbose= TRUE)
+  
+  #intra and inter spp dists
+  intra_spp_dist <- intra_dist(distmat, spp_names, return_max = FALSE, return_names = FALSE)
+  inter_spp_dist <- inter_dist(distmat, spp_names, return_min = FALSE)
+  
+  # Function to find mixed
+  mixed_bins <- function(intra, inter, gap=0){
+    within_bounds <- inter[inter < (max(intra)+gap)]
+    if(length(within_bounds) > 0){
+      return(c(unique(names(intra)),unique(names(within_bounds))))
+    } else {
+      return(unique(names(intra)))
+    }
+  }
+  
+  bins <- purrr::map2(as.list(intra_spp_dist), inter_spp_dist, mixed_bins)
+  
+  # combine all bins with the same name
+  uniq_names <- unique(names(bins))
+  uniq_bins <- vector("list", length=length(uniq_names))
+  names(uniq_bins) <- uniq_names
+  for (b in 1:length(uniq_names)){
+    uniq_bins[[b]] <- unique(unlist(bins[names(bins) == uniq_names[b]]))
+  }
+  
+  # Recursively match all names 
+  combined_bins <- uniq_bins %>% 
+    purrr::map_dfr(~{
+      matched <- vector("character")
+      to_match <- .x %>% sort() %>% unique()
+      while(length(to_match) > 0){
+        matching_bins <- uniq_bins %>% purrr::map_lgl(~{any(str_detect(.x, to_match))})
+        new_match <- unique(unname(unlist(uniq_bins[matching_bins])))
+        to_match <- new_match[!new_match %in% matched]
+        matched <- unique(c(matched, new_match))
+      }
+      # Check only one genus
+      genus_name <- unique(matched %>% str_remove(" .*$"))
+      if(length(genus_name)==1){
+        out <- matched %>%
+          str_remove_all(genus_name) %>%
+          str_remove_all(" ") %>%
+          sort() %>%
+          unique() %>% 
+          paste(collapse="/") %>%
+          paste(genus_name,.) 
+      } else {
+        warning("More than one genus in complex for species ",.x )
+        out <- NA
+      }
+      return(out)
+    })
+  out <- tibble(old_names = names(combined_bins),
+                    new_names = unlist(combined_bins))
+}
+

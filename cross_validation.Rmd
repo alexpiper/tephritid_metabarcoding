@@ -20,7 +20,8 @@ knitr::opts_chunk$set(echo = TRUE)
   "patchwork",
   "ape",
   "stringi",
-  "magrittr"
+  "magrittr"#,
+ # "TreeTools"
   )
 
 .bioc_packages <- c(
@@ -63,12 +64,22 @@ This test assigns all the reference sequences back to the database without leavi
 ## COI 
 
 ```{r COI}
-trainingSet <- readRDS("reference/COI_idtaxa.rds")
+# Separate taxa
+idtaxa_db <- "reference/COI_idtaxa.rds"
+blast_db <-"reference/COI_hierarchial.fa.gz"
+
+# Agglomerated taxa
+#idtaxa_db <- "reference/COI_idtaxa_renamed.rds"
+#blast_db <-"reference/COI_hierarchial_renamed.fa.gz"
+
+trainingSet <- readRDS(idtaxa_db)
 
 # get the sequences from the subset seqtab
-dna <- readDNAStringSet("reference/COI_hierarchial.fa")
-  
+dna <- readDNAStringSet(blast_db)
+
 dna <- RemoveGaps(dna)
+
+# Try with full arthropod one
 
 # Classify for that ref_db
 ids <- IdTaxa(dna, trainingSet, processors=1, threshold = 60, verbose=TRUE, strand = "top") 
@@ -93,7 +104,7 @@ tax <- t(sapply(ids, function(x) {
 seqs <- as.DNAbin(dna)
 names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
 
-blast_spp <- blast_assign_species(query=seqs,db="reference/COI_hierarchial.fa", identity=97, coverage=95, evalue=1e06,
+blast_spp <- blast_assign_species(query=seqs,db=blast_db, identity=97, coverage=95, evalue=1e06,
                                   max_target_seqs=5, max_hsp=5,
                                   ranks=c("Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") , delim=";") %>%
     dplyr::rename(blast_genus = Genus, blast_spp = Species) %>%
@@ -137,6 +148,8 @@ coi_id_success <- tax_blast %>%
   mutate(Genus = str_extract(expected, "^.*_") %>% str_remove("_")) %>%
   mutate(Binom = paste0(Genus, "_", Species))
 
+# post renaming
+#coi_id_success_renamed <- coi_id_success
 
 # Create summary
 coi_id_success  %>%
@@ -179,15 +192,23 @@ saveRDS(training_set, file="reference/COI_idtaxa_renamed.rds")
 
 ## EIF3L 
 ```{r IDTAXA BLAST}
-trainingSet <- readRDS("reference/EIF3L_idtaxa.rds")
+# Separate taxa
+idtaxa_db <- "reference/EIF3L_idtaxa.rds"
+blast_db <-"reference/EIF3L_hierarchial.fa.gz"
+
+# Agglomerated taxa
+#idtaxa_db <- "reference/EIF3L_idtaxa_renamed.rds"
+#blast_db <-"reference/EIF3L_hierarchial_renamed.fa.gz"
+
+trainingSet <- readRDS(idtaxa_db)
 
 # get the sequences from the subset seqtab
-dna <- readDNAStringSet("reference/EIF3L_hierarchial.fa")
+dna <- readDNAStringSet(blast_db)
   
 dna <- RemoveGaps(dna)
 
 # Classify for that ref_db
-ids <- IdTaxa(dna, trainingSet, processors=1, threshold = 60, verbose=TRUE, strand = "top") 
+ids <- IdTaxa(dna, trainingSet, processors=1, threshold = 60, verbose=TRUE, strand = "both") 
   
 ranks <-  c("Root","Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") 
 
@@ -209,7 +230,7 @@ tax <- t(sapply(ids, function(x) {
 seqs <- as.DNAbin(dna)
 names(seqs) <- names(seqs) %>% str_replace_all(" ", "_")
 
-blast_spp <- blast_assign_species(query=seqs,db="reference/EIF3L_hierarchial.fa", identity=97, coverage=95, evalue=1e06,
+blast_spp <- blast_assign_species(query=seqs,db=blast_db, identity=97, coverage=95, evalue=1e06,
                                   max_target_seqs=5, max_hsp=5,
                                   ranks=c("Kingdom", "Phylum","Class", "Order", "Family", "Genus","Species") , delim=";") %>%
     dplyr::rename(blast_genus = Genus, blast_spp = Species) %>%
@@ -253,6 +274,10 @@ eif3l_id_success <- tax_blast %>%
   mutate(Genus = str_extract(expected, "^.*_") %>% str_remove("_")) %>%
   mutate(Binom = paste0(Genus, "_", Species))
 
+
+# post renaming
+#eif3l_id_success_renamed <- eif3l_id_success
+
 # Create summary
 eif3l_id_success  %>%
     unnest(Species) %>%
@@ -290,4 +315,35 @@ saveRDS(training_set, file="reference/EIF3L_idtaxa_renamed.rds")
 # Rename taxa
 
 ```
+
+
+# Cluster OTUS
+
+```{r}
+dna <- readDNAStringSet("reference/COI_hierarchial.fa")
+  
+dna <- RemoveGaps(dna)
+
+test_clustered <- cluster_otus(dna,method = "complete",similarity = 0.99) 
+
+test <- test_clustered %>%
+  left_join(enframe(as.vector(dna), name="tax", value="sequence"))
+
+test2 <- test %>%
+  tidyr::separate(tax, into=c("acc", "kingdom", "phylum", "class", "order", "family", "genus", "species"), sep=";") %>%
+  tidyr::separate(acc, into=c("acc", "taxid"), sep="\\|")
+
+test3 <- test2 %>% 
+  group_by(cluster, cluster_size) %>%
+  summarise(species = species %>%
+      sort() %>%
+      unique() %>% 
+      paste(collapse="/"))
+
+
+
+
+```
+
+
 
